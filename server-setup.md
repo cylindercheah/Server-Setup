@@ -79,7 +79,7 @@ Sure — here’s the full **Markdown** version you can copy-paste directly:
 This guide configures the wired interface `ens35f0` to automatically connect at boot and use a static IP.
 
 ---
-
+```
 ## 1. List connections
 ```bash
 nmcli connection show
