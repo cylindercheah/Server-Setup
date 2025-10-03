@@ -1,3 +1,11 @@
+| Server | MAC address (ens35f0) | MAC address (ens35f1) | MAC address (BMC0) | MAC address (BMC1) |
+|--------|------------------------|------------------------|---------------------|---------------------|
+| Node A2 | 98:03:9B:A2:63:6E | 98:03:9B:A2:63:6F | 6C:92:BF:9F:A1:84 | 6C:92:BF:9F:A1:85 |
+| Node B2 | 98:03:9B:A2:12:62 | 98:03:9B:A2:12:63 | 6C:92:BF:9F:90:98 | 6C:92:BF:9F:90:99 |
+| Node C2 | 98:03:9B:A2:02:52 | 98:03:9B:A2:02:53 | 6C:92:BF:9F:93:7A | 6C:92:BF:9F:93:7B |
+| Node D2 | 98:03:9B:A1:88:BE | 98:03:9B:A1:88:BF | 6C:92:BF:9F:90:7A | 6C:92:BF:9F:90:7B |
+
+
 # Server-Setup
 
 A practical guide and scripts to bring an Inspur i24 server online on a small LAN and enable multi-user remote desktop access via VNC.
