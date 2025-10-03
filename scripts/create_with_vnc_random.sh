@@ -5,8 +5,11 @@
 
 # 密码配置
 PASSWORD_LENGTH=12  # 密码长度（默认12位）
-PASSWORD_FILE="/root/vnc_users_passwords.txt"  # 密码保存文件
-CSV_FILE="/root/vnc_users_passwords.csv"  # CSV格式密码文件
+
+# 保存文件（使用脚本所在目录，与 create_with_vnc_custom.sh 统一）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PASSWORD_FILE="$SCRIPT_DIR/vnc_users_passwords.txt"  # 可读CSV风格文本
+CSV_FILE="$SCRIPT_DIR/vnc_users_passwords.csv"       # 纯CSV
 
 # 检查是否以root运行
 if [ "$(id -u)" -ne 0 ]; then
@@ -385,16 +388,25 @@ USER_PASSWORDS=()
 FAILED_USERS=()
 SKIPPED_DISPLAYS=()
 
-# 初始化密码文件
 echo "# VNC用户密码列表" > "$PASSWORD_FILE"
 echo "# 创建时间: $(date '+%Y-%m-%d %H:%M:%S')" >> "$PASSWORD_FILE"
 echo "# ====================================" >> "$PASSWORD_FILE"
 echo "" >> "$PASSWORD_FILE"
-chmod 600 "$PASSWORD_FILE"
-
-# 初始化CSV文件
 echo "username,password,vnc_port,display_port" > "$CSV_FILE"
-chmod 600 "$CSV_FILE"
+# 初始化（如果不存在则创建并写入表头；存在则追加）
+if [ ! -f "$PASSWORD_FILE" ]; then
+    {
+        echo "# VNC用户密码列表"
+        echo "# 创建时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# ===================================="
+        echo "# 字段: Username,Password,VNC_TCP_Port,Display,Created_At"
+        echo "Username,Password,VNC_TCP_Port,Display,Created_At"
+    } > "$PASSWORD_FILE"
+fi
+if [ ! -f "$CSV_FILE" ]; then
+    echo "username,password,vnc_port,display_port,created_at" > "$CSV_FILE"
+fi
+chmod 644 "$PASSWORD_FILE" "$CSV_FILE"
 
 # 循环创建用户
 for (( i=START_NUM; i<=END_NUM; i++ )); do
@@ -465,11 +477,14 @@ for (( i=START_NUM; i<=END_NUM; i++ )); do
             # 计算VNC端口
             VNC_PORT=$((5900 + PORT))
             
-            # 保存到密码文件（文本格式）
-            echo "$USERNAME:$PASSWORD" >> "$PASSWORD_FILE"
-            
-            # 保存到CSV文件
-            echo "$USERNAME,$PASSWORD,$VNC_PORT,$PORT" >> "$CSV_FILE"
+                        # 保存记录（追加）
+                        NOW_TS="$(date '+%Y-%m-%d %H:%M:%S')"
+                        printf "%s,%s,%s,%s,%s\n" "$USERNAME" "$PASSWORD" "$VNC_PORT" "$PORT" "$NOW_TS" >> "$PASSWORD_FILE"
+                        if head -1 "$CSV_FILE" | grep -q 'created_at'; then
+                            printf "%s,%s,%s,%s,%s\n" "$USERNAME" "$PASSWORD" "$VNC_PORT" "$PORT" "$NOW_TS" >> "$CSV_FILE"
+                        else
+                            printf "%s,%s,%s,%s\n" "$USERNAME" "$PASSWORD" "$VNC_PORT" "$PORT" >> "$CSV_FILE"
+                        fi
             
             echo "  用户 $USERNAME 配置完成！（密码: $PASSWORD）"
         else

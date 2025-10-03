@@ -6,6 +6,11 @@
 # 统一密码（账户密码和VNC密码保持一致）
 PASSWORD="12345678"
 
+# 保存文件（使用脚本所在目录，与 create_with_vnc_custom.sh 统一）
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PASSWORD_FILE="$SCRIPT_DIR/vnc_users_passwords.txt"
+CSV_FILE="$SCRIPT_DIR/vnc_users_passwords.csv"
+
 # 检查是否以root运行
 if [ "$(id -u)" -ne 0 ]; then
     echo "错误：此脚本需要使用 root 权限运行！"
@@ -355,6 +360,21 @@ get_user_range
 echo "开始批量创建用户并设置VNC..."
 echo "======================================"
 
+# 初始化（如不存在则创建写入表头；存在则保持并追加）
+if [ ! -f "$PASSWORD_FILE" ]; then
+    {
+        echo "# VNC用户密码列表"
+        echo "# 创建时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# ===================================="
+        echo "# 字段: Username,Password,VNC_TCP_Port,Display,Created_At"
+        echo "Username,Password,VNC_TCP_Port,Display,Created_At"
+    } > "$PASSWORD_FILE"
+fi
+if [ ! -f "$CSV_FILE" ]; then
+    echo "username,password,vnc_port,display_port,created_at" > "$CSV_FILE"
+fi
+chmod 644 "$PASSWORD_FILE" "$CSV_FILE"
+
 # 记录成功创建的用户
 CREATED_USERS=()
 FAILED_USERS=()
@@ -414,8 +434,17 @@ for (( i=START_NUM; i<=END_NUM; i++ )); do
     # 只有在用户账户存在且有效时才设置VNC
     if [ "$USER_EXISTS" = true ]; then
         if setup_vnc_for_user "$USERNAME" "$PASSWORD" "$PORT"; then
-            CREATED_USERS+=("$USERNAME:$PORT")
-            echo "  用户 $USERNAME 配置完成！"
+                        CREATED_USERS+=("$USERNAME:$PORT")
+                        # 记录信息
+                        NOW_TS="$(date '+%Y-%m-%d %H:%M:%S')"
+                        VNC_PORT=$((5900 + PORT))
+                        printf "%s,%s,%s,%s,%s\n" "$USERNAME" "$PASSWORD" "$VNC_PORT" "$PORT" "$NOW_TS" >> "$PASSWORD_FILE"
+                        if head -1 "$CSV_FILE" | grep -q 'created_at'; then
+                            printf "%s,%s,%s,%s,%s\n" "$USERNAME" "$PASSWORD" "$VNC_PORT" "$PORT" "$NOW_TS" >> "$CSV_FILE"
+                        else
+                            printf "%s,%s,%s,%s\n" "$USERNAME" "$PASSWORD" "$VNC_PORT" "$PORT" >> "$CSV_FILE"
+                        fi
+                        echo "  用户 $USERNAME 配置完成！"
         else
             FAILED_USERS+=("$USERNAME:VNC设置失败")
             echo "  警告：用户 $USERNAME 存在但VNC设置失败"
