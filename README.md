@@ -116,6 +116,12 @@ firewall-cmd --list-ports
 - LAN quick reference: [`server-setup.md`](server-setup.md)
 - VNC provisioning script: [`create_with_vnc.sh`](create_with_vnc.sh)
 - Hardware manual: [`Inspur Server i24&NS5162M5 User Manual V1.2.pdf`](Inspur%20Server%20i24%26NS5162M5%20User%20Manual%20V1.2.pdf)
+- Community uploads: [`uploads/`](uploads/)
+
+## Contributing
+
+Want to add your own scripts, configs, or documentation? **Yes, you can upload a folder here!**
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for step-by-step instructions on how to add files and folders via the GitHub web interface or the command line.
 
 ## Security
 - Change default passwords immediately (script default is `12345678`)
