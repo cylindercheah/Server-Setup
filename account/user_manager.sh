@@ -53,6 +53,94 @@ show_selectable_users() {
     echo "" >&2
 }
 
+# 选择用户角色：admin（wheel）或 standard
+ask_user_role() {
+    local role_choice
+    local normalized
+
+    prompt_info "请选择用户角色：1) admin（加入 wheel） 2) standard（普通用户） [默认: 2]:"
+    read -r role_choice
+    normalized="${role_choice,,}"
+
+    case "$normalized" in
+        1|admin)
+            echo "admin"
+            ;;
+        ""|2|standard)
+            echo "standard"
+            ;;
+        *)
+            prompt_warning "无效角色输入，使用默认角色: standard"
+            echo "standard"
+            ;;
+    esac
+}
+
+# 判断用户是否属于 wheel 组
+is_user_admin() {
+    local username=$1
+    id -nG "$username" 2>/dev/null | tr ' ' '\n' | grep -qx "wheel"
+}
+
+# 确保用户home目录权限为严格私有（700）
+ensure_private_home() {
+    local username=$1
+    local home_dir
+
+    home_dir=$(getent passwd "$username" | cut -d: -f6)
+    if [ -z "$home_dir" ] || [ ! -d "$home_dir" ]; then
+        print_warning "未找到用户 $username 的home目录，跳过权限收紧"
+        return 1
+    fi
+
+    chown "$username:$username" "$home_dir" >/dev/null 2>&1 || true
+    if chmod 700 "$home_dir"; then
+        print_success "已设置 $home_dir 权限为 700"
+        return 0
+    fi
+
+    print_error "设置 $home_dir 权限失败"
+    return 1
+}
+
+# 应用用户角色：admin -> wheel；standard -> 从wheel移除
+apply_user_role() {
+    local username=$1
+    local role=$2
+
+    if ! getent group wheel >/dev/null 2>&1; then
+        print_error "系统缺少 wheel 组，无法应用角色"
+        return 1
+    fi
+
+    case "$role" in
+        admin)
+            if usermod -aG wheel "$username"; then
+                print_success "用户 $username 已提升为 admin（已加入 wheel）"
+                return 0
+            fi
+            print_error "提升用户 $username 为 admin 失败"
+            return 1
+            ;;
+        standard)
+            if is_user_admin "$username"; then
+                if gpasswd -d "$username" wheel >/dev/null 2>&1; then
+                    print_success "用户 $username 已降级为 standard（已移出 wheel）"
+                    return 0
+                fi
+                print_error "将用户 $username 从 wheel 移除失败"
+                return 1
+            fi
+            print_info "用户 $username 当前已是 standard（不在 wheel）"
+            return 0
+            ;;
+        *)
+            print_error "未知角色: $role"
+            return 1
+            ;;
+    esac
+}
+
 # 检查root权限
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -120,6 +208,7 @@ create_user() {
     local password=$2
     local shell=$3
     local comment=$4
+    local role=${5:-standard}
     
     if [ -z "$username" ]; then
         print_error "用户名不能为空"
@@ -151,8 +240,16 @@ create_user() {
         print_error "为用户 $username 设置密码失败"
         return 1
     fi
+
+    if ! apply_user_role "$username" "$role"; then
+        return 1
+    fi
+
+    if ! ensure_private_home "$username"; then
+        return 1
+    fi
     
-    print_success "已创建用户 $username, shell: $shell, 密码: $password"
+    print_success "已创建用户 $username, 角色: $role, shell: $shell, 密码: $password"
     return 0
 }
 
@@ -671,6 +768,9 @@ batch_mode() {
         prompt_info "请输入用户备注（所有用户使用相同备注）："
         read -r comment
     fi
+
+    local role
+    role=$(ask_user_role)
     
     # 询问是否配置VNC
     prompt_info "是否为用户配置VNC？(y/n) [默认: n]:"
@@ -712,7 +812,7 @@ batch_mode() {
     local created_users=()
     local current_display_no="$start_display_no"
     for username in $user_list; do
-        create_user "$username" "$password" "$shell" "$comment"
+        create_user "$username" "$password" "$shell" "$comment" "$role"
         local result=$?
         
         if [ $result -eq 0 ] || [ $result -eq 2 ]; then
@@ -745,6 +845,7 @@ batch_mode() {
         done
         echo ""
         echo "用户密码: $password"
+        echo "用户角色: $role"
         echo "默认Shell: $shell"
         if [[ "$setup_vnc_choice" =~ ^[Yy]$ ]]; then
             echo "VNC密码: $vnc_password"
@@ -803,11 +904,14 @@ single_mode() {
         prompt_info "请输入用户备注："
         read -r comment
     fi
+
+    local role
+    role=$(ask_user_role)
     
     echo ""
     
     # 创建用户
-    create_user "$username" "$password" "$shell" "$comment"
+    create_user "$username" "$password" "$shell" "$comment" "$role"
     local result=$?
     
     if [ $result -eq 0 ] || [ $result -eq 2 ]; then
@@ -852,6 +956,55 @@ single_mode() {
     echo ""
     print_success "处理完成！"
     echo ""
+}
+
+# 修改现有用户角色模式
+modify_user_role_mode() {
+    echo ""
+    echo "=========================================="
+    echo "         修改现有用户角色"
+    echo "=========================================="
+    echo ""
+
+    show_selectable_users
+    prompt_info "请输入要修改角色的用户名："
+    read -r username
+
+    if [ -z "$username" ]; then
+        print_error "用户名不能为空！"
+        return
+    fi
+
+    if ! id "$username" &>/dev/null; then
+        print_error "用户 $username 不存在！"
+        return
+    fi
+
+    local current_role="standard"
+    if is_user_admin "$username"; then
+        current_role="admin"
+    fi
+    print_info "用户 $username 当前角色: $current_role"
+
+    local target_role
+    target_role=$(ask_user_role)
+
+    if [ "$target_role" = "$current_role" ]; then
+        print_info "角色未变化，无需修改"
+        return
+    fi
+
+    prompt_info "确认将用户 $username 角色从 $current_role 修改为 $target_role？(y/n) [默认: n]:"
+    read -r confirm_change
+    if ! [[ "$confirm_change" =~ ^[Yy]$ ]]; then
+        print_warning "已取消角色修改"
+        return
+    fi
+
+    if apply_user_role "$username" "$target_role"; then
+        ensure_private_home "$username" >/dev/null 2>&1 || true
+        print_success "用户 $username 角色修改完成"
+    fi
 }
 
 # 仅VNC配置模式
@@ -973,7 +1126,8 @@ show_menu() {
     echo "  2) 创建单个用户和配置VNC"
     echo "  3) 仅为现有用户配置VNC"
     echo "  4) 删除用户（含VNC清理）"
-    echo "  5) 退出"
+    echo "  5) 修改现有用户角色（admin/standard）"
+    echo "  6) 退出"
     echo ""
     echo "=========================================="
 }
@@ -982,7 +1136,7 @@ show_menu() {
 main() {
     while true; do
         show_menu
-        prompt_info "请输入选项 (1-5):"
+        prompt_info "请输入选项 (1-6):"
         read -r choice
         
         case $choice in
@@ -999,6 +1153,9 @@ main() {
                 delete_mode
                 ;;
             5)
+                modify_user_role_mode
+                ;;
+            6)
                 print_info "退出脚本，再见！"
                 exit 0
                 ;;
