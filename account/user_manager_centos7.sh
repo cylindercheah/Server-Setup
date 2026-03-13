@@ -832,6 +832,7 @@ enable_start_vnc_service() {
     local geometry=$3
     local localhost_mode=$4
     local unit_name="vncserver@:${display_no}.service"
+    local unit_file="/etc/systemd/system/${unit_name}"
 
     if ! command -v vncserver >/dev/null 2>&1; then
         print_error "未找到 vncserver 命令，请先安装 tigervnc-server"
@@ -844,6 +845,24 @@ enable_start_vnc_service() {
 
     if ! systemctl daemon-reload; then
         print_error "systemd daemon-reload 失败"
+        return 1
+    fi
+
+    if [ ! -f "$unit_file" ]; then
+        print_error "未找到自定义VNC单元: $unit_file"
+        print_error "已拒绝回退到系统默认 vncserver@.service（可能触发旧版 wrapper 参数问题）"
+        return 1
+    fi
+
+    if grep -q -- "-localhost no" "$unit_file"; then
+        print_warning "检测到旧参数 '-localhost no'，正在自动修复..."
+        sed -i 's/ -localhost no//g' "$unit_file"
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+
+    if grep -q "vncserver_wrapper" "$unit_file"; then
+        print_error "检测到 wrapper 形式单元，已拒绝启动: $unit_file"
+        print_error "请删除该单元后重新执行脚本生成自定义单元"
         return 1
     fi
 
