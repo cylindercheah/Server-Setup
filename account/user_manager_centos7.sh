@@ -324,7 +324,7 @@ ask_start_display() {
 # 询问并获取VNC桌面配置
 ask_vnc_desktop_config() {
     local default_geometry="1920x1080"
-    local default_session="gnome"
+    local default_session="xfce"
     local geometry
     local session
     local localhost_choice
@@ -349,6 +349,74 @@ ask_vnc_desktop_config() {
     fi
 
     echo "$geometry|$session|$localhost_value"
+}
+
+# 获取映射文件中指定显示号的用户
+get_mapped_display_owner() {
+    local display_no=$1
+    local map_file="/etc/tigervnc/vncserver.users"
+
+    if [ ! -f "$map_file" ]; then
+        return 0
+    fi
+
+    awk -F'=' -v target=":${display_no}" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+        $1 == target { print $2; exit }
+    ' "$map_file"
+}
+
+# 获取旧版自定义单元中指定显示号的用户
+get_legacy_unit_display_owner() {
+    local display_no=$1
+    local unit_file="/etc/systemd/system/vncserver@:${display_no}.service"
+
+    if [ ! -f "$unit_file" ]; then
+        return 0
+    fi
+
+    awk -F'=' '
+        /^User=/ { print $2; exit }
+    ' "$unit_file"
+}
+
+# 检查会话可用性与关键依赖
+check_vnc_runtime_requirements() {
+    local session=$1
+    local session_cmd
+    local has_fallback=0
+
+    if ! command -v xauth >/dev/null 2>&1; then
+        print_error "缺少 xauth，TigerVNC 无法启动"
+        echo "请安装: yum install -y xorg-x11-xauth"
+        return 1
+    fi
+
+    session_cmd=$(get_session_start_command "$session")
+    if command -v "$session_cmd" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v startxfce4 >/dev/null 2>&1; then
+        has_fallback=1
+    fi
+
+    if [ -x /etc/X11/xinit/xinitrc ]; then
+        has_fallback=1
+    fi
+
+    if command -v xterm >/dev/null 2>&1; then
+        has_fallback=1
+    fi
+
+    if [ "$has_fallback" -eq 1 ]; then
+        print_warning "会话 '$session' 不可用，将使用 xstartup 回退会话"
+        return 0
+    fi
+
+    print_error "找不到可用桌面会话（$session/startxfce4/xinitrc/xterm）"
+    echo "可尝试安装: yum groupinstall -y \"Xfce\" && yum install -y xterm"
+    return 1
 }
 
 # 将用户映射到 /etc/tigervnc/vncserver.users
@@ -437,11 +505,28 @@ EOF
 # 获取当前占用指定显示号的Xvnc用户（若无则为空）
 get_display_owner() {
     local display_no=$1
+    local owner
 
-    ps -eo user,args | awk -v d=":${display_no}" '
+    owner=$(ps -eo user,args | awk -v d=":${display_no}" '
         index($0, "/usr/bin/Xvnc " d " ") { print $1; exit }
         $0 ~ ("/usr/bin/Xvnc " d "$") { print $1; exit }
-    '
+    ')
+
+    if [ -n "$owner" ]; then
+        echo "$owner"
+        return 0
+    fi
+
+    owner=$(get_mapped_display_owner "$display_no")
+    if [ -n "$owner" ]; then
+        echo "$owner"
+        return 0
+    fi
+
+    owner=$(get_legacy_unit_display_owner "$display_no")
+    if [ -n "$owner" ]; then
+        echo "$owner"
+    fi
 }
 
 # 强制回收显示号（停止旧会话并清理锁文件）
@@ -763,6 +848,8 @@ enable_start_vnc_service() {
 
     if ! systemctl restart "$unit_name"; then
         print_error "重启 $unit_name 失败"
+        systemctl status "$unit_name" --no-pager -l 2>/dev/null | tail -n 20 || true
+        journalctl -u "$unit_name" -n 20 --no-pager 2>/dev/null || true
         return 1
     fi
 
@@ -784,6 +871,11 @@ setup_vnc_systemd() {
         return 1
     fi
 
+    if ! check_vnc_runtime_requirements "$session"; then
+        print_error "用户 $username 的VNC运行环境检查失败，已跳过 systemd 启动"
+        return 1
+    fi
+
     print_info "正在检查显示号 :$display_no 的占用情况..."
     resolved_display_no=$(resolve_display_for_user "$username" "$display_no") || {
         return 1
@@ -795,10 +887,6 @@ setup_vnc_systemd() {
 
     set_vnc_display_mapping "$username" "$resolved_display_no"
     write_vnc_xstartup "$username" "$session"
-
-    if ! command -v "$session" >/dev/null 2>&1; then
-        print_warning "会话命令 '$session' 不存在，已在 xstartup 中启用自动回退（startxfce4/xinitrc/xterm）"
-    fi
 
     if enable_start_vnc_service "$username" "$resolved_display_no" "$geometry" "$localhost_mode"; then
         print_success "用户 $username 的 systemd VNC 配置完成，连接地址端口: $((5900 + resolved_display_no))"
@@ -1092,6 +1180,102 @@ vnc_only_mode() {
     echo ""
 }
 
+# 仅启用VNC开机自启模式（不修改现有VNC密码）
+autostart_only_mode() {
+    echo ""
+    echo "=========================================="
+    echo "   为现有用户启用VNC开机自启（CentOS7）"
+    echo "=========================================="
+    echo ""
+
+    prompt_info "请输入用户名列表（用空格分隔）："
+    read -r user_list
+
+    if [ -z "$user_list" ]; then
+        print_error "用户列表不能为空！"
+        return
+    fi
+
+    local start_display_no
+    local geometry
+    local localhost_choice
+    local localhost_mode="no"
+    local overwrite_xstartup_choice
+    local overwrite_xstartup="n"
+    local session="xfce"
+
+    start_display_no=$(ask_start_display "请输入起始显示号（第一个用户将使用该显示号）" "2")
+
+    prompt_info "请输入VNC分辨率 [默认: 1920x1080]:"
+    read -r geometry
+    if [ -z "$geometry" ]; then
+        geometry="1920x1080"
+    fi
+
+    prompt_info "是否仅允许本机访问（localhost）？(y/n) [默认: n]:"
+    read -r localhost_choice
+    if [[ "$localhost_choice" =~ ^[Yy]$ ]]; then
+        localhost_mode="yes"
+    fi
+
+    prompt_info "是否覆盖现有 ~/.vnc/xstartup？(y/n) [默认: n]:"
+    read -r overwrite_xstartup_choice
+    if [[ "$overwrite_xstartup_choice" =~ ^[Yy]$ ]]; then
+        overwrite_xstartup="y"
+        prompt_info "请输入桌面会话（如 gnome/xfce）[默认: xfce]:"
+        read -r session
+        if [ -z "$session" ]; then
+            session="xfce"
+        fi
+    fi
+
+    echo ""
+    print_info "开始启用VNC开机自启..."
+    echo ""
+
+    local current_display_no="$start_display_no"
+    for username in $user_list; do
+        if ! id "$username" &>/dev/null; then
+            print_warning "用户 $username 不存在，跳过"
+            echo ""
+            continue
+        fi
+
+        if [ ! -f "/home/$username/.vnc/passwd" ]; then
+            print_warning "用户 $username 尚未设置VNC密码（缺少 /home/$username/.vnc/passwd），请先执行 vncpasswd"
+            echo ""
+            continue
+        fi
+
+        local resolved_display_no
+        resolved_display_no=$(resolve_display_for_user "$username" "$current_display_no") || {
+            print_warning "已跳过用户 $username 的开机自启配置"
+            echo ""
+            current_display_no=$((current_display_no + 1))
+            continue
+        }
+
+        if [ "$resolved_display_no" != "$current_display_no" ]; then
+            print_info "用户 $username 将使用显示号 :$resolved_display_no（原请求 :$current_display_no）"
+        fi
+
+        set_vnc_display_mapping "$username" "$resolved_display_no"
+
+        if [[ "$overwrite_xstartup" =~ ^[Yy]$ ]]; then
+            write_vnc_xstartup "$username" "$session"
+        else
+            print_info "保留用户 $username 现有 ~/.vnc/xstartup"
+        fi
+
+        enable_start_vnc_service "$username" "$resolved_display_no" "$geometry" "$localhost_mode"
+        current_display_no=$((resolved_display_no + 1))
+        echo ""
+    done
+
+    print_success "VNC开机自启配置流程完成！"
+    echo ""
+}
+
 # 删除用户模式（含VNC清理）
 delete_mode() {
     echo ""
@@ -1147,8 +1331,9 @@ show_menu() {
     echo "  1) 批量创建用户和配置VNC"
     echo "  2) 创建单个用户和配置VNC"
     echo "  3) 仅为现有用户配置VNC"
-    echo "  4) 删除用户（含VNC清理）"
-    echo "  5) 退出"
+    echo "  4) 仅为现有用户启用VNC开机自启"
+    echo "  5) 删除用户（含VNC清理）"
+    echo "  6) 退出"
     echo ""
     echo "=========================================="
 }
@@ -1157,7 +1342,7 @@ show_menu() {
 main() {
     while true; do
         show_menu
-        prompt_info "请输入选项 (1-5):"
+        prompt_info "请输入选项 (1-6):"
         read -r choice
         
         case $choice in
@@ -1171,9 +1356,12 @@ main() {
                 vnc_only_mode
                 ;;
             4)
-                delete_mode
+                autostart_only_mode
                 ;;
             5)
+                delete_mode
+                ;;
+            6)
                 print_info "退出脚本，再见！"
                 exit 0
                 ;;
