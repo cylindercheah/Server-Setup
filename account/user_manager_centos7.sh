@@ -1298,6 +1298,28 @@ autostart_only_mode() {
     echo ""
 }
 
+# 显示当前可删除的普通用户列表
+show_existing_users_for_delete() {
+    local users
+
+    users=$(awk -F: '
+        $3 >= 1000 && $1 != "nobody" && $6 ~ "^/home/" {
+            print $1
+        }
+    ' /etc/passwd)
+
+    if [ -z "$users" ]; then
+        print_warning "未检测到 /home 下的普通用户"
+        return 0
+    fi
+
+    print_info "当前可删除的普通用户："
+    while IFS= read -r user; do
+        [ -n "$user" ] && echo "  - $user"
+    done <<< "$users"
+    echo ""
+}
+
 # 删除用户模式（含VNC清理）
 delete_mode() {
     echo ""
@@ -1305,6 +1327,8 @@ delete_mode() {
     echo "         删除用户和VNC清理"
     echo "=========================================="
     echo ""
+
+    show_existing_users_for_delete
 
     prompt_info "请输入要删除的用户名列表（用空格分隔）："
     read -r user_list
