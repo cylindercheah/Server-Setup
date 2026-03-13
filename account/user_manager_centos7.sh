@@ -62,19 +62,101 @@ has_firewall_cmd() {
     command -v firewall-cmd >/dev/null 2>&1
 }
 
-# 查找系统中的 TigerVNC systemd 模板单元
-get_vnc_template_service_path() {
-    if [ -f "/usr/lib/systemd/system/vncserver@.service" ]; then
-        echo "/usr/lib/systemd/system/vncserver@.service"
+# 获取 runuser 可执行路径
+get_runuser_bin() {
+    if command -v runuser >/dev/null 2>&1; then
+        command -v runuser
         return 0
     fi
 
-    if [ -f "/lib/systemd/system/vncserver@.service" ]; then
-        echo "/lib/systemd/system/vncserver@.service"
+    if [ -x "/sbin/runuser" ]; then
+        echo "/sbin/runuser"
+        return 0
+    fi
+
+    if [ -x "/usr/sbin/runuser" ]; then
+        echo "/usr/sbin/runuser"
         return 0
     fi
 
     return 1
+}
+
+# 获取会话启动命令
+get_session_start_command() {
+    local session=$1
+
+    case "$session" in
+        gnome|gnome-session)
+            echo "/usr/bin/gnome-session"
+            ;;
+        xfce|xfce4|xfce4-session)
+            if command -v startxfce4 >/dev/null 2>&1; then
+                echo "$(command -v startxfce4)"
+            else
+                echo "/usr/bin/xfce4-session"
+            fi
+            ;;
+        mate|mate-session)
+            echo "/usr/bin/mate-session"
+            ;;
+        kde|plasma|plasma-x11)
+            echo "/usr/bin/startplasma-x11"
+            ;;
+        *)
+            echo "$session"
+            ;;
+    esac
+}
+
+# 为指定显示号创建 CentOS 7 兼容的 TigerVNC 单元文件
+ensure_legacy_vnc_unit_file() {
+    local username=$1
+    local display_no=$2
+    local geometry=$3
+    local localhost_mode=$4
+    local runuser_bin
+    local unit_file="/etc/systemd/system/vncserver@:${display_no}.service"
+    local exec_start
+
+    runuser_bin=$(get_runuser_bin) || {
+        print_error "未找到 runuser 命令，无法创建VNC服务单元"
+        return 1
+    }
+
+    exec_start="${runuser_bin} -l ${username} -c '/usr/bin/vncserver :${display_no} -geometry ${geometry} -localhost ${localhost_mode}'"
+
+    cat > "$unit_file" <<EOF
+[Unit]
+Description=Remote desktop service (TigerVNC) for ${username} on :${display_no}
+After=syslog.target network.target
+
+[Service]
+Type=forking
+User=root
+PAMName=login
+PIDFile=/home/${username}/.vnc/%H:${display_no}.pid
+ExecStart=${exec_start}
+ExecStop=${runuser_bin} -l ${username} -c '/usr/bin/vncserver -kill :${display_no}'
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    chmod 644 "$unit_file"
+    print_success "已生成CentOS7 VNC服务单元: $unit_file"
+    return 0
+}
+
+# 删除指定显示号的自定义 VNC 单元文件
+remove_legacy_vnc_unit_file() {
+    local display_no=$1
+    local unit_file="/etc/systemd/system/vncserver@:${display_no}.service"
+
+    if [ -f "$unit_file" ]; then
+        rm -f "$unit_file"
+        print_success "已删除自定义VNC单元: $unit_file"
+    fi
 }
 
 # 获取系统可用的shell并让用户选择
@@ -315,29 +397,30 @@ set_vnc_display_mapping() {
     print_success "已设置VNC显示映射: :$display_no=$username"
 }
 
-# 生成 ~/.vnc/config（由 systemd vncserver@.service 读取）
-write_vnc_config() {
+# 生成 CentOS 7 兼容的 ~/.vnc/xstartup
+write_vnc_xstartup() {
     local username=$1
-    local geometry=$2
-    local session=$3
-    local localhost_mode=$4
+    local session=$2
     local home_dir="/home/$username"
     local vnc_dir="$home_dir/.vnc"
-    local cfg_file="$vnc_dir/config"
+    local startup_file="$vnc_dir/xstartup"
+    local session_cmd
 
     mkdir -p "$vnc_dir"
+    session_cmd=$(get_session_start_command "$session")
 
-    cat > "$cfg_file" <<EOF
-session=$session
-geometry=$geometry
-localhost=$localhost_mode
+    cat > "$startup_file" <<EOF
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+exec ${session_cmd}
 EOF
 
-    chown "$username:$username" "$vnc_dir" "$cfg_file"
+    chown "$username:$username" "$vnc_dir" "$startup_file"
     chmod 700 "$vnc_dir"
-    chmod 600 "$cfg_file"
+    chmod 700 "$startup_file"
 
-    print_success "已写入 $cfg_file"
+    print_success "已写入 $startup_file（会话: $session）"
 }
 
 # 获取当前占用指定显示号的Xvnc用户（若无则为空）
@@ -361,22 +444,48 @@ force_reclaim_display() {
     rm -f "/tmp/.X${display_no}-lock" "/tmp/.X11-unix/X${display_no}"
 }
 
-# 获取用户在 /etc/tigervnc/vncserver.users 中映射的显示号列表（不带冒号）
+# 获取用户在旧版CentOS7自定义VNC单元中的显示号列表（不带冒号）
+get_user_vnc_displays_from_legacy_units() {
+    local username=$1
+    local unit_file
+    local display_no
+
+    for unit_file in /etc/systemd/system/vncserver@:*.service; do
+        [ -e "$unit_file" ] || continue
+
+        if ! grep -Eq "ExecStart=.*-l[[:space:]]+${username}([[:space:]]|$)" "$unit_file"; then
+            continue
+        fi
+
+        display_no=$(basename "$unit_file" | sed -E 's/^vncserver@:(.+)\.service$/\1/')
+        if [[ "$display_no" =~ ^[0-9]+$ ]]; then
+            echo "$display_no"
+        fi
+    done
+}
+
+# 获取用户在 /etc/tigervnc/vncserver.users 或旧版自定义VNC单元中的显示号列表（不带冒号）
 get_user_vnc_displays() {
     local username=$1
     local map_file="/etc/tigervnc/vncserver.users"
+    local mapping_displays=""
+    local legacy_displays=""
 
-    if [ ! -f "$map_file" ]; then
-        return 0
+    if [ -f "$map_file" ]; then
+        mapping_displays=$(awk -F'=' -v user="$username" '
+            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
+            $2 == user {
+                gsub(/^:/, "", $1)
+                print $1
+            }
+        ' "$map_file")
     fi
 
-    awk -F'=' -v user="$username" '
-        /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-        $2 == user {
-            gsub(/^:/, "", $1)
-            print $1
-        }
-    ' "$map_file"
+    legacy_displays=$(get_user_vnc_displays_from_legacy_units "$username")
+
+    printf '%s\n%s\n' "$mapping_displays" "$legacy_displays" \
+        | awk 'NF && $0 ~ /^[0-9]+$/ && !seen[$0]++ { print }' \
+        | sort -n
 }
 
 # 删除用户在 /etc/tigervnc/vncserver.users 的映射
@@ -423,11 +532,13 @@ cleanup_vnc_for_user() {
     local zone
     local firewall_changed=0
     local manage_firewall=0
+    local unit_file_removed=0
 
     displays=$(get_user_vnc_displays "$username")
 
     if [ -z "$displays" ]; then
-        print_warning "未发现用户 $username 的VNC显示号映射"
+        remove_user_vnc_mappings "$username"
+        print_warning "未发现用户 $username 的VNC显示号（已尝试清理映射）"
         return 0
     fi
 
@@ -446,6 +557,8 @@ cleanup_vnc_for_user() {
 
         systemctl stop "$unit_name" >/dev/null 2>&1 || true
         systemctl disable "$unit_name" >/dev/null 2>&1 || true
+        remove_legacy_vnc_unit_file "$d"
+        unit_file_removed=1
         force_reclaim_display "$d"
         print_success "已停止并禁用 $unit_name"
 
@@ -458,6 +571,10 @@ cleanup_vnc_for_user() {
 
     remove_user_vnc_mappings "$username"
     print_success "已清理用户 $username 的VNC显示号映射"
+
+    if [ "$unit_file_removed" -eq 1 ]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
 
     if [ "$manage_firewall" -eq 1 ] && [ "$firewall_changed" -eq 1 ]; then
         firewall-cmd --reload >/dev/null 2>&1 || true
@@ -608,16 +725,20 @@ resolve_display_for_user() {
 
 # 启用并启动指定显示号的systemd VNC服务
 enable_start_vnc_service() {
-    local display_no=$1
+    local username=$1
+    local display_no=$2
+    local geometry=$3
+    local localhost_mode=$4
     local unit_name="vncserver@:${display_no}.service"
-    local template_path
 
-    template_path=$(get_vnc_template_service_path) || {
-        print_error "未找到 vncserver@.service，请先安装 tigervnc-server"
+    if ! command -v vncserver >/dev/null 2>&1; then
+        print_error "未找到 vncserver 命令，请先安装 tigervnc-server"
         return 1
-    }
+    fi
 
-    print_info "检测到VNC模板单元: $template_path"
+    if ! ensure_legacy_vnc_unit_file "$username" "$display_no" "$geometry" "$localhost_mode"; then
+        return 1
+    fi
 
     if ! systemctl daemon-reload; then
         print_error "systemd daemon-reload 失败"
@@ -662,9 +783,9 @@ setup_vnc_systemd() {
     fi
 
     set_vnc_display_mapping "$username" "$resolved_display_no"
-    write_vnc_config "$username" "$geometry" "$session" "$localhost_mode"
+    write_vnc_xstartup "$username" "$session"
 
-    if enable_start_vnc_service "$resolved_display_no"; then
+    if enable_start_vnc_service "$username" "$resolved_display_no" "$geometry" "$localhost_mode"; then
         print_success "用户 $username 的 systemd VNC 配置完成，连接地址端口: $((5900 + resolved_display_no))"
         return 0
     fi
