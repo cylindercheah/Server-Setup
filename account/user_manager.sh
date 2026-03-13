@@ -35,6 +35,24 @@ prompt_warning() {
     print_warning "$1" >&2
 }
 
+# 显示可供选择的普通用户（用于VNC配置/删除）
+show_selectable_users() {
+    local users
+
+    users=$(awk -F: '($3>=1000)&&($1!="nobody") {print $1}' /etc/passwd)
+
+    echo "" >&2
+    prompt_info "当前系统用户列表 (UID>=1000, 非nobody):"
+    if [ -n "$users" ]; then
+        while IFS= read -r username; do
+            echo "  - $username" >&2
+        done <<< "$users"
+    else
+        print_warning "未发现可供选择的普通用户"
+    fi
+    echo "" >&2
+}
+
 # 检查root权限
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -152,7 +170,7 @@ setup_vnc() {
     # 检查vncpasswd命令是否可用
     if ! command -v vncpasswd &> /dev/null; then
         print_error "vncpasswd 命令未找到，请先安装 TigerVNC 或 TightVNC"
-        echo "可以尝试: sudo apt install tigervnc-common 或 sudo yum install tigervnc-server"
+        echo "可以尝试: sudo dnf install tigervnc tigervnc-server"
         return 1
     fi
     
@@ -844,6 +862,7 @@ vnc_only_mode() {
     echo "=========================================="
     echo ""
     
+    show_selectable_users
     prompt_info "请输入用户名列表（用空格分隔）："
     read -r user_list
     
@@ -905,6 +924,7 @@ delete_mode() {
     echo "=========================================="
     echo ""
 
+    show_selectable_users
     prompt_info "请输入要删除的用户名列表（用空格分隔）："
     read -r user_list
 
