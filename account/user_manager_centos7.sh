@@ -116,6 +116,11 @@ ensure_legacy_vnc_unit_file() {
     local geometry=$3
     local localhost_mode=$4
     local unit_file="/etc/systemd/system/vncserver@:${display_no}.service"
+    local localhost_arg=""
+
+    if [ "$localhost_mode" = "yes" ]; then
+        localhost_arg="-localhost"
+    fi
 
     cat > "$unit_file" <<EOF
 [Unit]
@@ -131,7 +136,7 @@ WorkingDirectory=/home/${username}
 PIDFile=/home/${username}/.vnc/%H:${display_no}.pid
 ExecStartPre=-/usr/bin/bash -c '/usr/bin/vncserver -kill :${display_no} >/dev/null 2>&1 || true'
 ExecStartPre=-/usr/bin/bash -c '/usr/bin/rm -f /tmp/.X${display_no}-lock /tmp/.X11-unix/X${display_no} /home/${username}/.vnc/*:${display_no}.pid >/dev/null 2>&1 || true'
-ExecStart=/usr/bin/vncserver :${display_no} -geometry ${geometry} -localhost ${localhost_mode}
+ExecStart=/usr/bin/vncserver :${display_no} -geometry ${geometry} ${localhost_arg}
 ExecStop=/usr/bin/vncserver -kill :${display_no}
 
 [Install]
