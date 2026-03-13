@@ -124,12 +124,13 @@ After=syslog.target network.target
 
 [Service]
 Type=forking
+PermissionsStartOnly=true
 User=${username}
 Group=${username}
 WorkingDirectory=/home/${username}
 PIDFile=/home/${username}/.vnc/%H:${display_no}.pid
-ExecStartPre=/usr/bin/bash -c '/usr/bin/vncserver -kill :${display_no} >/dev/null 2>&1 || true'
-ExecStartPre=/usr/bin/rm -f /tmp/.X${display_no}-lock /tmp/.X11-unix/X${display_no} /home/${username}/.vnc/*:${display_no}.pid
+ExecStartPre=-/usr/bin/bash -c '/usr/bin/vncserver -kill :${display_no} >/dev/null 2>&1 || true'
+ExecStartPre=-/usr/bin/bash -c '/usr/bin/rm -f /tmp/.X${display_no}-lock /tmp/.X11-unix/X${display_no} /home/${username}/.vnc/*:${display_no}.pid >/dev/null 2>&1 || true'
 ExecStart=/usr/bin/vncserver :${display_no} -geometry ${geometry} -localhost ${localhost_mode}
 ExecStop=/usr/bin/vncserver -kill :${display_no}
 
