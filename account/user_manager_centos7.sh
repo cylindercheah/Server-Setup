@@ -1148,6 +1148,8 @@ vnc_only_mode() {
     echo "         VNC密码配置"
     echo "=========================================="
     echo ""
+
+    show_existing_users_for_vnc_setup
     
     prompt_info "请输入用户名列表（用空格分隔）："
     read -r user_list
@@ -1209,6 +1211,8 @@ autostart_only_mode() {
     echo "   为现有用户启用VNC开机自启（CentOS7）"
     echo "=========================================="
     echo ""
+
+    show_existing_users_for_vnc_setup
 
     prompt_info "请输入用户名列表（用空格分隔）："
     read -r user_list
@@ -1295,6 +1299,28 @@ autostart_only_mode() {
     done
 
     print_success "VNC开机自启配置流程完成！"
+    echo ""
+}
+
+# 显示当前可用于VNC配置的普通用户列表
+show_existing_users_for_vnc_setup() {
+    local users
+
+    users=$(awk -F: '
+        $3 >= 1000 && $1 != "nobody" && $6 ~ "^/home/" {
+            print $1
+        }
+    ' /etc/passwd)
+
+    if [ -z "$users" ]; then
+        print_warning "未检测到 /home 下的普通用户"
+        return 0
+    fi
+
+    print_info "当前可用于VNC配置的普通用户："
+    while IFS= read -r user; do
+        [ -n "$user" ] && echo "  - $user"
+    done <<< "$users"
     echo ""
 }
 
