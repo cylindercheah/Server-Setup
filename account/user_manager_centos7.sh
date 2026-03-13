@@ -551,12 +551,23 @@ get_user_vnc_displays_from_legacy_units() {
     done
 }
 
+# 获取用户当前运行中的Xvnc显示号列表（不带冒号）
+get_user_vnc_displays_from_processes() {
+    local username=$1
+
+    ps -eo user,args | awk -v user="$username" '
+        $1 != user { next }
+        match($0, /\/usr\/bin\/Xvnc :([0-9]+)/, m) { print m[1] }
+    '
+}
+
 # 获取用户在 /etc/tigervnc/vncserver.users 或旧版自定义VNC单元中的显示号列表（不带冒号）
 get_user_vnc_displays() {
     local username=$1
     local map_file="/etc/tigervnc/vncserver.users"
     local mapping_displays=""
     local legacy_displays=""
+    local process_displays=""
 
     if [ -f "$map_file" ]; then
         mapping_displays=$(awk -F'=' -v user="$username" '
@@ -569,8 +580,9 @@ get_user_vnc_displays() {
     fi
 
     legacy_displays=$(get_user_vnc_displays_from_legacy_units "$username")
+    process_displays=$(get_user_vnc_displays_from_processes "$username")
 
-    printf '%s\n%s\n' "$mapping_displays" "$legacy_displays" \
+    printf '%s\n%s\n%s\n' "$mapping_displays" "$legacy_displays" "$process_displays" \
         | awk 'NF && $0 ~ /^[0-9]+$/ && !seen[$0]++ { print }' \
         | sort -n
 }
