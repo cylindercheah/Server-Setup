@@ -90,13 +90,6 @@ get_session_start_command() {
         gnome|gnome-session)
             echo "/usr/bin/gnome-session"
             ;;
-        xfce|xfce4|xfce4-session)
-            if command -v startxfce4 >/dev/null 2>&1; then
-                echo "$(command -v startxfce4)"
-            else
-                echo "/usr/bin/xfce4-session"
-            fi
-            ;;
         mate|mate-session)
             echo "/usr/bin/mate-session"
             ;;
@@ -330,7 +323,7 @@ ask_start_display() {
 # 询问并获取VNC桌面配置
 ask_vnc_desktop_config() {
     local default_geometry="1920x1080"
-    local default_session="xfce"
+    local default_session="gnome"
     local geometry
     local session
     local localhost_choice
@@ -342,7 +335,7 @@ ask_vnc_desktop_config() {
         geometry="$default_geometry"
     fi
 
-    prompt_info "请输入桌面会话（如 gnome/xfce）[默认: $default_session]:"
+    prompt_info "请输入桌面会话（如 gnome）[默认: $default_session]:"
     read -r session
     if [ -z "$session" ]; then
         session="$default_session"
@@ -403,10 +396,6 @@ check_vnc_runtime_requirements() {
         return 0
     fi
 
-    if command -v startxfce4 >/dev/null 2>&1; then
-        has_fallback=1
-    fi
-
     if [ -x /etc/X11/xinit/xinitrc ]; then
         has_fallback=1
     fi
@@ -420,8 +409,8 @@ check_vnc_runtime_requirements() {
         return 0
     fi
 
-    print_error "找不到可用桌面会话（$session/startxfce4/xinitrc/xterm）"
-    echo "可尝试安装: yum groupinstall -y \"Xfce\" && yum install -y xterm"
+    print_error "找不到可用桌面会话（$session/xinitrc/xterm）"
+    echo "可尝试安装GNOME或安装 xterm 作为回退终端"
     return 1
 }
 
@@ -484,10 +473,6 @@ unset DBUS_SESSION_BUS_ADDRESS
 
 if command -v ${session_cmd} >/dev/null 2>&1; then
     exec ${session_cmd}
-fi
-
-if command -v startxfce4 >/dev/null 2>&1; then
-    exec startxfce4
 fi
 
 if [ -x /etc/X11/xinit/xinitrc ]; then
@@ -1227,7 +1212,7 @@ autostart_only_mode() {
     local localhost_mode="no"
     local overwrite_xstartup_choice
     local overwrite_xstartup="n"
-    local session="xfce"
+    local session="gnome"
 
     start_display_no=$(ask_start_display "请输入起始显示号（第一个用户将使用该显示号）" "2")
 
@@ -1247,10 +1232,10 @@ autostart_only_mode() {
     read -r overwrite_xstartup_choice
     if [[ "$overwrite_xstartup_choice" =~ ^[Yy]$ ]]; then
         overwrite_xstartup="y"
-        prompt_info "请输入桌面会话（如 gnome/xfce）[默认: xfce]:"
+        prompt_info "请输入桌面会话（如 gnome）[默认: gnome]:"
         read -r session
         if [ -z "$session" ]; then
-            session="xfce"
+            session="gnome"
         fi
     fi
 
