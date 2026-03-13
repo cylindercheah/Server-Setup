@@ -115,16 +115,7 @@ ensure_legacy_vnc_unit_file() {
     local display_no=$2
     local geometry=$3
     local localhost_mode=$4
-    local runuser_bin
     local unit_file="/etc/systemd/system/vncserver@:${display_no}.service"
-    local exec_start
-
-    runuser_bin=$(get_runuser_bin) || {
-        print_error "未找到 runuser 命令，无法创建VNC服务单元"
-        return 1
-    }
-
-    exec_start="${runuser_bin} -l ${username} -c '/usr/bin/vncserver :${display_no} -geometry ${geometry} -localhost ${localhost_mode}'"
 
     cat > "$unit_file" <<EOF
 [Unit]
@@ -133,11 +124,14 @@ After=syslog.target network.target
 
 [Service]
 Type=forking
-User=root
-PAMName=login
+User=${username}
+Group=${username}
+WorkingDirectory=/home/${username}
 PIDFile=/home/${username}/.vnc/%H:${display_no}.pid
-ExecStart=${exec_start}
-ExecStop=${runuser_bin} -l ${username} -c '/usr/bin/vncserver -kill :${display_no}'
+ExecStartPre=/usr/bin/bash -c '/usr/bin/vncserver -kill :${display_no} >/dev/null 2>&1 || true'
+ExecStartPre=/usr/bin/rm -f /tmp/.X${display_no}-lock /tmp/.X11-unix/X${display_no} /home/${username}/.vnc/*:${display_no}.pid
+ExecStart=/usr/bin/vncserver :${display_no} -geometry ${geometry} -localhost ${localhost_mode}
+ExecStop=/usr/bin/vncserver -kill :${display_no}
 
 [Install]
 WantedBy=multi-user.target
@@ -413,7 +407,24 @@ write_vnc_xstartup() {
 #!/bin/sh
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
-exec ${session_cmd}
+
+if command -v ${session_cmd} >/dev/null 2>&1; then
+    exec ${session_cmd}
+fi
+
+if command -v startxfce4 >/dev/null 2>&1; then
+    exec startxfce4
+fi
+
+if [ -x /etc/X11/xinit/xinitrc ]; then
+    exec /etc/X11/xinit/xinitrc
+fi
+
+if command -v xterm >/dev/null 2>&1; then
+    exec xterm
+fi
+
+exit 1
 EOF
 
     chown "$username:$username" "$vnc_dir" "$startup_file"
@@ -453,7 +464,7 @@ get_user_vnc_displays_from_legacy_units() {
     for unit_file in /etc/systemd/system/vncserver@:*.service; do
         [ -e "$unit_file" ] || continue
 
-        if ! grep -Eq "ExecStart=.*-l[[:space:]]+${username}([[:space:]]|$)" "$unit_file"; then
+        if ! grep -Eq "^User=${username}$|ExecStart=.*-l[[:space:]]+${username}([[:space:]]|$)" "$unit_file"; then
             continue
         fi
 
@@ -784,6 +795,10 @@ setup_vnc_systemd() {
 
     set_vnc_display_mapping "$username" "$resolved_display_no"
     write_vnc_xstartup "$username" "$session"
+
+    if ! command -v "$session" >/dev/null 2>&1; then
+        print_warning "会话命令 '$session' 不存在，已在 xstartup 中启用自动回退（startxfce4/xinitrc/xterm）"
+    fi
 
     if enable_start_vnc_service "$username" "$resolved_display_no" "$geometry" "$localhost_mode"; then
         print_success "用户 $username 的 systemd VNC 配置完成，连接地址端口: $((5900 + resolved_display_no))"
