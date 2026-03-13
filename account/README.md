@@ -6,11 +6,13 @@ A powerful interactive Shell script for batch creating Linux users and configuri
 
 - 🚀 **Batch User Creation** - Create multiple user accounts at once
 - 👤 **Single User Mode** - Quickly create individual users
+- 👥 **User Role Management** - Support `admin`/`standard` role assignment and modify existing user roles
 - 🖥️ **VNC Configuration** - Automatically configure VNC remote desktop for users
 - 🔁 **systemd Integration (Recommended)** - Auto-write display mapping and enable auto-start VNC service
 - 🗑️ **Delete User (with VNC Cleanup)** - Remove account and reclaim related VNC resources in one flow
 - 🎨 **Colorful Interactive Interface** - Clear visual feedback (info, success, warning, error)
 - 🔒 **Secure Password Input** - Passwords are hidden during input
+- 🏠 **Private Home Permissions** - New user home directory is automatically tightened to `700`
 - ⚙️ **Custom Shell** - Automatically read available shells (bash, zsh, fish, etc.) from system for user selection
 - 🔍 **Smart Checks** - Automatically detect existing users to avoid duplicates
 - 📋 **Operation Summary** - Detailed results displayed after completion
@@ -32,7 +34,7 @@ sudo apt install tigervnc-common
 
 **CentOS/RHEL:**
 ```bash
-sudo yum install tigervnc-server
+sudo dnf install tigervnc tigervnc-server
 ```
 
 ## 🚀 Quick Start
@@ -72,7 +74,8 @@ Please select operation mode:
   2) Create single user and configure VNC
   3) Configure VNC for existing users only
   4) Delete user (with VNC cleanup)
-  5) Exit
+  5) Modify existing user role (admin/standard)
+  6) Exit
 
 ==========================================
 ```
@@ -87,8 +90,9 @@ Suitable for creating multiple user accounts at once.
 2. Enter username list (space-separated), e.g., `alice bob charlie`
 3. Enter unified password (same password for all users)
 4. Select default shell from system available shells (such as bash, zsh, fish, etc.)
-5. Choose whether to configure VNC (y/n)
-6. If configuring VNC, enter VNC password
+5. Select user role (`admin` or `standard`)
+6. Choose whether to configure VNC (y/n)
+7. If configuring VNC, enter VNC password
 
 **Example:**
 ```
@@ -124,8 +128,9 @@ Suitable for creating individual user accounts with different passwords.
 2. Enter username
 3. Enter user password
 4. Select default shell from system available shells
-5. Choose whether to configure VNC
-6. If configuring VNC, enter VNC password
+5. Select user role (`admin` or `standard`)
+6. Choose whether to configure VNC
+7. If configuring VNC, enter VNC password
 
 **Example:**
 ```
@@ -158,8 +163,9 @@ Suitable for batch configuring VNC access for existing users.
 **Steps:**
 
 1. Select option `3`
-2. Enter username list (space-separated)
-3. Enter VNC password
+2. Review displayed selectable users (UID>=1000 and not `nobody`)
+3. Enter username list (space-separated)
+4. Enter VNC password
 
 **Example:**
 ```
@@ -177,8 +183,9 @@ Suitable for account deprovisioning while reclaiming that user's VNC resources.
 **Steps:**
 
 1. Select option `4`
-2. Enter username list to delete (space-separated)
-3. Confirm deletion when prompted (`y` required)
+2. Review displayed selectable users (UID>=1000 and not `nobody`)
+3. Enter username list to delete (space-separated)
+4. Confirm deletion when prompted (`y` required)
 
 **Example:**
 ```
@@ -211,10 +218,31 @@ y
 - Confirm that VNC access for that user is no longer required (`:N` / `5900+N`)
 - If you opened a firewall port range (such as `5900-5999/tcp`), note the script will not remove that range rule
 
+### Mode 5: Modify Existing User Role (admin/standard)
+
+Suitable when you need to adjust privilege level without deleting the account.
+
+**Steps:**
+
+1. Select option `5`
+2. Review displayed selectable users
+3. Enter the username to modify
+4. Choose target role:
+  - `admin`: runs `usermod -aG wheel username`
+  - `standard`: runs `gpasswd -d username wheel`
+5. Confirm role change when prompted
+
+**Notes:**
+
+- `admin` is implemented by membership in the `wheel` group
+- `standard` means the user is not in `wheel`
+- Role changes do not delete user data or VNC configuration
+
 ## 🔐 Security Notes
 
 - ✅ Script requires root privileges and will check automatically
 - ✅ Passwords are hidden during input
+- ✅ New user home directory permissions are automatically set to 700 (user-only access)
 - ✅ VNC password file permissions automatically set to 600 (user read/write only)
 - ✅ VNC directory permissions automatically set to 700 (user access only)
 - ⚠️ Strong passwords are recommended
@@ -228,10 +256,16 @@ y
 ### Q: Shows "vncpasswd command not found"?
 **A:** Need to install VNC service first:
 - Ubuntu/Debian: `sudo apt install tigervnc-common`
-- CentOS/RHEL: `sudo yum install tigervnc-server`
+- CentOS/RHEL: `sudo dnf install tigervnc tigervnc-server`
 
 ### Q: What happens if user already exists?
 **A:** Script will detect and skip creation, but can still configure VNC for that user.
+
+### Q: What's the difference between `admin` and `standard`?
+**A:** `admin` users are added to `wheel`; `standard` users are not. This does not automatically bypass file permissions for other users' homes unless sudo/root is explicitly used.
+
+### Q: Can I modify a user's role later?
+**A:** Yes. Use option 5, “Modify existing user role (admin/standard)”.
 
 ### Q: Can I set different passwords for different users?
 **A:** Use "Single User Mode" (option 2) to set different passwords for each user. Batch mode uses unified password.
@@ -348,6 +382,8 @@ sudo ./user_manager.sh
 - Home directory automatically created (`/home/username`)
 - Select default shell from system available shells (read from `/etc/shells`)
 - User password automatically set
+- Role selection supported: `admin` (added to `wheel`) or `standard`
+- Home directory permissions are tightened to `700`
 
 ### VNC Configuration
 - VNC config directory: `/home/username/.vnc/`
