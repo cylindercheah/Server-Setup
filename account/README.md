@@ -7,6 +7,8 @@ A powerful interactive Shell script for batch creating Linux users and configuri
 - 🚀 **Batch User Creation** - Create multiple user accounts at once
 - 👤 **Single User Mode** - Quickly create individual users
 - 🖥️ **VNC Configuration** - Automatically configure VNC remote desktop for users
+- 🔁 **systemd Integration (Recommended)** - Auto-write display mapping and enable auto-start VNC service
+- 🗑️ **Delete User (with VNC Cleanup)** - Remove account and reclaim related VNC resources in one flow
 - 🎨 **Colorful Interactive Interface** - Clear visual feedback (info, success, warning, error)
 - 🔒 **Secure Password Input** - Passwords are hidden during input
 - ⚙️ **Custom Shell** - Automatically read available shells (bash, zsh, fish, etc.) from system for user selection
@@ -15,31 +17,22 @@ A powerful interactive Shell script for batch creating Linux users and configuri
 
 ## 📋 System Requirements
 
-- Linux operating system (Ubuntu, Debian, RHEL/AlmaLinux, etc.)
+- Linux operating system (Ubuntu, Debian, CentOS, etc.)
 - Root privileges (must run with sudo)
-- `bash`
-- For VNC functionality: TigerVNC server utilities
-- For a full VNC desktop: at least one desktop session such as `XFCE`, `GNOME`, `MATE`, or `LXQt`
+- bash or zsh shell
+- For VNC functionality: TigerVNC or TightVNC
 
-### Install VNC / Desktop Packages (Optional)
-
-The script can detect missing TigerVNC packages and prompt to install them.
+### Install VNC (Optional)
 
 **Ubuntu/Debian:**
 ```bash
 sudo apt update
-sudo apt install tigervnc-standalone-server tigervnc-tools xauth xfonts-base
+sudo apt install tigervnc-common
 ```
 
-**RHEL / AlmaLinux / Rocky:**
+**CentOS/RHEL:**
 ```bash
-sudo dnf install tigervnc-server xauth xorg-x11-fonts-Type1 xorg-x11-fonts-misc
-```
-
-**Install XFCE on AlmaLinux / RHEL-like hosts (recommended for VNC):**
-```bash
-sudo dnf install epel-release
-sudo dnf group install Xfce
+sudo yum install tigervnc-server
 ```
 
 ## 🚀 Quick Start
@@ -78,7 +71,8 @@ Please select operation mode:
   1) Batch create users and configure VNC
   2) Create single user and configure VNC
   3) Configure VNC for existing users only
-  4) Exit
+  4) Delete user (with VNC cleanup)
+  5) Exit
 
 ==========================================
 ```
@@ -95,8 +89,6 @@ Suitable for creating multiple user accounts at once.
 4. Select default shell from system available shells (such as bash, zsh, fish, etc.)
 5. Choose whether to configure VNC (y/n)
 6. If configuring VNC, enter VNC password
-7. Choose whether to allow direct VNC client connections or keep VNC bound to localhost only
-8. Choose the VNC desktop mode
 
 **Example:**
 ```
@@ -120,19 +112,6 @@ y
 
 Please enter VNC password:
 ********
-
-Allow direct VNC client connections? (y/n) [default: n]:
-n
-
-Please select VNC desktop mode:
-  1) Auto select (recommended; will use XFCE on this host)
-  2) Minimal X11
-  3) XFCE
-  4) GNOME Classic
-  5) GNOME
-
-Please enter number [default: 1]:
-1
 ```
 
 ### Mode 2: Create Single User and Configure VNC
@@ -147,8 +126,6 @@ Suitable for creating individual user accounts with different passwords.
 4. Select default shell from system available shells
 5. Choose whether to configure VNC
 6. If configuring VNC, enter VNC password
-7. Choose direct access or localhost-only mode
-8. Choose the VNC desktop mode
 
 **Example:**
 ```
@@ -172,19 +149,6 @@ y
 
 Please enter VNC password:
 ********
-
-Allow direct VNC client connections? (y/n) [default: n]:
-n
-
-Please select VNC desktop mode:
-  1) Auto select (recommended; will use XFCE when available)
-  2) Minimal X11
-  3) XFCE
-  4) GNOME Classic
-  5) GNOME
-
-Please enter number [default: 1]:
-1
 ```
 
 ### Mode 3: Configure VNC for Existing Users Only
@@ -196,8 +160,6 @@ Suitable for batch configuring VNC access for existing users.
 1. Select option `3`
 2. Enter username list (space-separated)
 3. Enter VNC password
-4. Choose direct access or localhost-only mode
-5. Choose the VNC desktop mode
 
 **Example:**
 ```
@@ -206,50 +168,48 @@ alice bob charlie
 
 Please enter VNC password:
 ********
-
-Allow direct VNC client connections? (y/n) [default: n]:
-n
-
-Please select VNC desktop mode:
-  1) Auto select (recommended; will use XFCE when available)
-  2) Minimal X11
-  3) XFCE
-  4) GNOME Classic
-  5) GNOME
-
-Please enter number [default: 1]:
-1
 ```
 
-## 🖥️ VNC Desktop Modes
+### Mode 4: Delete User (with VNC Cleanup)
 
-- **Auto** - Recommended. Prefer a stable full desktop, currently `XFCE` if installed.
-- **XFCE** - Recommended full desktop mode for VNC. Includes panel, desktop background, file manager, and normal window management.
-- **Minimal X11** - Fallback mode. Starts a very small X11 session for troubleshooting or very low-resource usage.
-- **GNOME Classic / GNOME** - Available when installed, but usually less stable than `XFCE` over TigerVNC.
+Suitable for account deprovisioning while reclaiming that user's VNC resources.
 
-The script now favors `XFCE` when it is available. If no lightweight full desktop is installed, `auto` may fall back to `Minimal X11`.
+**Steps:**
 
-## 🔌 VNC Connection Model
+1. Select option `4`
+2. Enter username list to delete (space-separated)
+3. Confirm deletion when prompted (`y` required)
 
-- **Recommended** - Keep VNC on `localhost` and connect through an SSH tunnel.
-- **Direct VNC** - Optional, but requires opening firewall ports and is less secure on shared networks.
+**Example:**
+```
+Please enter usernames to delete (space-separated):
+alice bob
 
-### Recommended SSH Tunnel Workflow
-
-If the script reports a session such as `display :11 (port 5911)`, connect from your laptop or workstation with:
-
-```bash
-ssh -N -L 25911:localhost:5911 username@server-ip
+Confirm delete user alice (with VNC service/port cleanup)? (y/n) [default: n]:
+y
 ```
 
-Then connect your VNC client to:
+**What “VNC cleanup” removes (exact scope):**
 
-```text
-localhost:25911
-```
+- Stops and disables each mapped `vncserver@:N.service` for that user
+- Reclaims display `:N` (terminates related Xvnc processes and removes `/tmp/.X<N>-lock` and `/tmp/.X11-unix/X<N>`)
+- Removes corresponding firewall port `5900+N/tcp` from the active zone (only if that exact port rule exists)
+- Removes that user’s entries from `/etc/tigervnc/vncserver.users`
+- Runs `firewall-cmd --reload` once if any port rule was removed
+- Finally runs `userdel -r username` to remove user account and home directory
 
-You can choose any free local port on your client machine. Only the right side of `-L` must match the server's VNC port.
+**What it does NOT remove:**
+
+- Other users’ VNC mappings, services, or ports
+- Unrelated firewall rules (for example, manual range rule `5900-5999/tcp`)
+- If the user does not exist, script still performs VNC cleanup only and continues
+
+**Pre-delete checklist (recommended):**
+
+- Ensure the user has no unsaved remote session/work
+- Back up `/home/username` first if data retention is needed
+- Confirm that VNC access for that user is no longer required (`:N` / `5900+N`)
+- If you opened a firewall port range (such as `5900-5999/tcp`), note the script will not remove that range rule
 
 ## 🔐 Security Notes
 
@@ -267,14 +227,8 @@ You can choose any free local port on your client machine. Only the right side o
 
 ### Q: Shows "vncpasswd command not found"?
 **A:** Need to install VNC service first:
-- Ubuntu/Debian: `sudo apt install tigervnc-standalone-server tigervnc-tools`
-- CentOS/RHEL: `sudo dnf install tigervnc-server`
-
-### Q: Which VNC desktop mode should I choose?
-**A:** Choose `Auto` or `XFCE`. `XFCE` is the recommended full desktop for TigerVNC on this setup.
-
-### Q: Why not use GNOME by default?
-**A:** GNOME often needs more session/system integration and is more likely to show black screens or startup issues under TigerVNC. `XFCE` is usually much more reliable.
+- Ubuntu/Debian: `sudo apt install tigervnc-common`
+- CentOS/RHEL: `sudo yum install tigervnc-server`
 
 ### Q: What happens if user already exists?
 **A:** Script will detect and skip creation, but can still configure VNC for that user.
@@ -285,15 +239,108 @@ You can choose any free local port on your client machine. Only the right side o
 ### Q: Must VNC password be the same as user password?
 **A:** No, VNC password can be different from user password.
 
-### Q: Do I still need to manually run `vncserver :1`?
-**A:** Usually no. The script now writes the VNC config, selects a free display automatically, starts the VNC session, and prints the display/port to use.
+### Q: How to start VNC service?
+**A:** Use `systemd` (supported by the script). Avoid manually starting deprecated `vncserver`.
+
+If you choose “Use systemd to manage VNC (recommended)” in the script, it will automatically:
+- Write display mapping to `/etc/tigervnc/vncserver.users` (e.g. `:2=user1`)
+- Write user VNC config to `/home/username/.vnc/config` (geometry/session/localhost)
+- Enable and start `vncserver@:N.service`
+
+You can verify manually:
+```bash
+sudo systemctl status vncserver@:2.service
+sudo systemctl status vncserver@:3.service
+```
+
+### Q: In option 4, what exactly will “VNC cleanup” remove?
+**A:** It cleans resources based on that user’s mappings in `/etc/tigervnc/vncserver.users`:
+- stop/disable `vncserver@:N.service`
+- reclaim display session and lock files
+- remove firewall allow rule for `5900+N/tcp` if present
+- remove mapped entries from the mapping file
+
+Then it runs `userdel -r` to remove the user and home directory.
 
 ### Q: How to connect to VNC?
-**A:** Prefer SSH tunneling. If the script says `display :10 (port 5910)`, run:
+**A:** Use a VNC client to connect to: `server-ip:port`, where `port = 5900 + display number`.
+
+Examples:
+- `:2 -> 5902`
+- `:3 -> 5903`
+- `:4 -> 5904`
+
+You can check display mappings in `/etc/tigervnc/vncserver.users`.
+
+## 🔧 Recommended Workflow (AlmaLinux/RHEL)
+
+### First-time setup (one-time)
+
+1. Install TigerVNC:
 ```bash
-ssh -N -L 25910:localhost:5910 username@server-ip
+sudo dnf install -y tigervnc tigervnc-server
 ```
-Then point your VNC client to `localhost:25910`.
+
+2. Open firewall rules (based on your needs):
+```bash
+# Single-port example
+sudo firewall-cmd --permanent --zone=public --add-port=5904/tcp
+
+# Or open common VNC range
+sudo firewall-cmd --permanent --zone=public --add-port=5900-5999/tcp
+
+sudo firewall-cmd --reload
+```
+
+> Important: add rules in the active NIC zone (for example `public`).
+
+2.1 Optional: configure via firewall GUI app (`firewall-config`)
+
+If you prefer GUI setup:
+
+1. Install and launch:
+```bash
+sudo dnf install -y firewall-config
+sudo firewall-config
+```
+
+2. In the top-right of the app:
+- enable `Permanent`
+- select the correct `Zone` (usually the active one, e.g. `public`)
+
+3. In the `Ports` tab add:
+- single-port example: `5904` + `tcp`
+- or range: `5900-5999` + `tcp`
+
+4. Click `Reload Firewall` (or run):
+```bash
+sudo firewall-cmd --reload
+```
+
+> Tip: if rules are added to the wrong zone, or only runtime rules are added without permanent save, VNC may still fail to connect.
+
+### Daily usage (after setup)
+
+1. Run script:
+```bash
+sudo ./user_manager.sh
+```
+
+2. In the script choose:
+- Configure VNC = `y`
+- Use systemd VNC = `y`
+- Enter display number (e.g. `2`, `3`)
+- Enter resolution (e.g. `1920x1080`)
+
+3. Connect with RealVNC directly:
+- `server-ip:5902` (for `:2`)
+- `server-ip:5903` (for `:3`)
+
+## ⚠️ About Manual `vncserver`
+
+- `vncserver` is now shown as deprecated in current TigerVNC path
+- Manually started sessions may drift to another display (e.g. `:4`), causing unstable port expectations
+- Manual sessions usually do not auto-recover after reboot
 
 ## 🛠️ Technical Details
 
@@ -303,11 +350,10 @@ Then point your VNC client to `localhost:25910`.
 - User password automatically set
 
 ### VNC Configuration
-- TigerVNC user config: `/home/username/.config/tigervnc/config`
-- Legacy/direct-launch config: `/home/username/.vnc/legacy-xdg/tigervnc/config`
-- VNC password files: `/home/username/.config/tigervnc/passwd` and `/home/username/.vnc/passwd`
-- Startup files: `/home/username/.vnc/xstartup` and `/home/username/.Xclients`
-- Typical full desktop mode on this setup: `XFCE`
+- VNC config directory: `/home/username/.vnc/`
+- Password file: `/home/username/.vnc/passwd`
+- Directory permissions: 700 (drwx------)
+- Password file permissions: 600 (-rw-------)
 
 ## 📄 License
 
