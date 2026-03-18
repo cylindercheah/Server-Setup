@@ -35,6 +35,94 @@ prompt_warning() {
     print_warning "$1" >&2
 }
 
+# VNC状态缓存关联数组 (需 Bash 4.0+)
+declare -A VNC_MAPPING_CACHE=()
+declare -A VNC_LEGACY_CACHE=()
+declare -A VNC_PROCESS_CACHE=()
+# 用户显示号聚合缓存 (user -> "d1 d2 ...")
+declare -A VNC_USER_DISPLAYS_CACHE=()
+
+VNC_MAPPING_READY=0
+VNC_LEGACY_READY=0
+VNC_PROCESS_READY=0
+FIREWALL_ZONE_SNAPSHOT=""
+FIREWALL_ZONE_READY=0
+
+# 重置缓存函数
+invalidate_vnc_state_cache() {
+    VNC_MAPPING_CACHE=()
+    VNC_LEGACY_CACHE=()
+    VNC_PROCESS_CACHE=()
+    VNC_USER_DISPLAYS_CACHE=()
+    VNC_MAPPING_READY=0
+    VNC_LEGACY_READY=0
+    VNC_PROCESS_READY=0
+    FIREWALL_ZONE_SNAPSHOT=""
+    FIREWALL_ZONE_READY=0
+}
+
+build_vnc_mapping_snapshot() {
+    local map_file="/etc/tigervnc/vncserver.users"
+    if [ "$VNC_MAPPING_READY" -eq 1 ]; then return 0; fi
+
+    if [ -f "$map_file" ]; then
+        # 一次性解析映射文件到关联数组
+        while read -r line; do
+            [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]] && continue
+            if [[ "$line" =~ ^:([0-9]+)=(.*) ]]; then
+                local d="${BASH_REMATCH[1]}"
+                local u="${BASH_REMATCH[2]}"
+                VNC_MAPPING_CACHE["$d"]="$u"
+                VNC_USER_DISPLAYS_CACHE["$u"]="${VNC_USER_DISPLAYS_CACHE["$u"]} $d"
+            fi
+        done < "$map_file"
+    fi
+    VNC_MAPPING_READY=1
+}
+
+build_vnc_legacy_snapshot() {
+    if [ "$VNC_LEGACY_READY" -eq 1 ]; then return 0; fi
+
+    local unit_files=(/etc/systemd/system/vncserver@:*.service)
+    if [ -e "${unit_files[0]}" ]; then
+        # 批量扫描 User= 行，减少外部调用
+        local line
+        while read -r line; do
+            # 格式: /path/to/vncserver@:N.service:User=username
+            if [[ "$line" =~ vncserver@:([0-9]+)\.service:User=(.*) ]]; then
+                local d="${BASH_REMATCH[1]}"
+                local u="${BASH_REMATCH[2]}"
+                VNC_LEGACY_CACHE["$d"]="$u"
+                VNC_USER_DISPLAYS_CACHE["$u"]="${VNC_USER_DISPLAYS_CACHE["$u"]} $d"
+            fi
+        done < <(grep -hR "^User=" /etc/systemd/system/vncserver@:*.service 2>/dev/null | grep -lR "^User=" /etc/systemd/system/vncserver@:*.service | xargs grep -H "^User=")
+        # 修正: 上面那个复合命令有点复杂，改用更稳妥的 grep
+        while read -r line; do
+             if [[ "$line" =~ @:([0-9]+)\.service:User=(.*) ]]; then
+                 local d="${BASH_REMATCH[1]}"
+                 local u="${BASH_REMATCH[2]}"
+                 VNC_LEGACY_CACHE["$d"]="$u"
+                 VNC_USER_DISPLAYS_CACHE["$u"]="${VNC_USER_DISPLAYS_CACHE["$u"]} $d"
+             fi
+        done < <(grep -H "^User=" /etc/systemd/system/vncserver@:*.service 2>/dev/null)
+    fi
+    VNC_LEGACY_READY=1
+}
+
+build_vnc_process_snapshot() {
+    if [ "$VNC_PROCESS_READY" -eq 1 ]; then return 0; fi
+
+    # ps 一次性拉取所有 Xvnc 进程
+    while read -r u d; do
+        if [[ -n "$u" && -n "$d" ]]; then
+            VNC_PROCESS_CACHE["$d"]="$u"
+            VNC_USER_DISPLAYS_CACHE["$u"]="${VNC_USER_DISPLAYS_CACHE["$u"]} $d"
+        fi
+    done < <(ps -eo user,args | awk 'match($0, /\/usr\/bin\/(Xvnc|Xtigervnc)[[:space:]]*:([0-9]+)/, m) { print $1 " " m[2] }')
+
+    VNC_PROCESS_READY=1
+}
+
 # 检查root权限
 check_root() {
     if [ "$(id -u)" -ne 0 ]; then
@@ -87,7 +175,7 @@ get_session_start_command() {
     local session=$1
 
     case "$session" in
-        gnome|gnome-session)
+        gnome|gnome-session|gnome-classic|gnome-classic-session)
             echo "/usr/bin/gnome-session"
             ;;
         mate|mate-session)
@@ -121,15 +209,13 @@ Description=Remote desktop service (TigerVNC) for ${username} on :${display_no}
 After=syslog.target network.target
 
 [Service]
-Type=forking
+Type=simple
 PermissionsStartOnly=true
-User=${username}
-Group=${username}
 WorkingDirectory=/home/${username}
 PIDFile=/home/${username}/.vnc/%H:${display_no}.pid
 ExecStartPre=-/usr/bin/bash -c '/usr/bin/vncserver -kill :${display_no} >/dev/null 2>&1 || true'
 ExecStartPre=-/usr/bin/bash -c '/usr/bin/rm -f /tmp/.X${display_no}-lock /tmp/.X11-unix/X${display_no} /home/${username}/.vnc/*:${display_no}.pid >/dev/null 2>&1 || true'
-ExecStart=/usr/bin/vncserver :${display_no} -geometry ${geometry} ${localhost_arg}
+ExecStart=/usr/sbin/runuser -l "${username}" -c "/usr/bin/vncserver :${display_no} -geometry ${geometry} ${localhost_arg}"
 ExecStop=/usr/bin/vncserver -kill :${display_no}
 
 [Install]
@@ -210,6 +296,7 @@ create_user() {
     local password=$2
     local shell=$3
     local comment=$4
+    local is_admin=$5
     
     if [ -z "$username" ]; then
         print_error "用户名不能为空"
@@ -241,8 +328,31 @@ create_user() {
         print_error "为用户 $username 设置密码失败"
         return 1
     fi
+
+    # 可选：授予管理员权限（优先使用 wheel 组，兼容部分发行版的 sudo 组）
+    if [[ "$is_admin" =~ ^[Yy]$ ]]; then
+        if getent group wheel >/dev/null 2>&1; then
+            if usermod -aG wheel "$username" 2>&1; then
+                print_success "已将用户 $username 加入 wheel 管理员组"
+            else
+                print_warning "将用户 $username 加入 wheel 组失败，请手动检查"
+            fi
+        elif getent group sudo >/dev/null 2>&1; then
+            if usermod -aG sudo "$username" 2>&1; then
+                print_success "已将用户 $username 加入 sudo 管理员组"
+            else
+                print_warning "将用户 $username 加入 sudo 组失败，请手动检查"
+            fi
+        else
+            print_warning "未检测到 wheel/sudo 组，无法自动授予管理员权限"
+        fi
+    fi
     
-    print_success "已创建用户 $username, shell: $shell, 密码: $password"
+    if [[ "$is_admin" =~ ^[Yy]$ ]]; then
+        print_success "已创建用户 $username, shell: $shell, 密码: $password, 管理员: 是"
+    else
+        print_success "已创建用户 $username, shell: $shell, 密码: $password, 管理员: 否"
+    fi
     return 0
 }
 
@@ -250,6 +360,9 @@ create_user() {
 setup_vnc() {
     local username=$1
     local vnc_password=$2
+    local vnc_dir="/home/$username/.vnc"
+    local passwd_file="$vnc_dir/passwd"
+    local passwd_size
     
     # 检查用户是否存在
     if ! id "$username" &>/dev/null; then
@@ -265,23 +378,39 @@ setup_vnc() {
     fi
     
     # 创建.vnc目录（如果不存在）
-    if [ ! -d "/home/$username/.vnc" ]; then
-        mkdir -p "/home/$username/.vnc"
-        chown "$username:$username" "/home/$username/.vnc"
-        chmod 700 "/home/$username/.vnc"
-        print_info "已创建 /home/$username/.vnc 目录"
+    if [ ! -d "$vnc_dir" ]; then
+        mkdir -p "$vnc_dir"
+        chown "$username:$username" "$vnc_dir"
+        chmod 700 "$vnc_dir"
+        print_info "已创建 $vnc_dir 目录"
     fi
     
     # 设置VNC密码
     print_info "正在为 $username 设置VNC密码..."
-    if ! printf '%s\n' "$vnc_password" | run_as_user "$username" vncpasswd -f > "/home/$username/.vnc/passwd"; then
+    if ! printf '%s\n' "$vnc_password" | run_as_user "$username" bash -lc 'umask 077; mkdir -p "$HOME/.vnc"; vncpasswd -f > "$HOME/.vnc/passwd"'; then
         print_error "为用户 $username 生成VNC密码文件失败"
+        return 1
+    fi
+
+    if [ ! -f "$passwd_file" ]; then
+        print_error "未找到 $passwd_file，VNC密码设置失败"
+        return 1
+    fi
+
+    passwd_size=$(wc -c < "$passwd_file" 2>/dev/null)
+    if [ -z "$passwd_size" ] || [ "$passwd_size" -lt 8 ]; then
+        print_error "检测到异常的VNC密码文件（大小: ${passwd_size:-0}字节）"
         return 1
     fi
     
     # 设置权限
-    chown "$username:$username" "/home/$username/.vnc/passwd"
-    chmod 600 "/home/$username/.vnc/passwd"
+    chown "$username:$username" "$passwd_file"
+    chmod 600 "$passwd_file"
+
+    # SELinux 开启时，修正上下文可避免 Xvnc 读取 passwd 被拒绝
+    if command -v restorecon >/dev/null 2>&1; then
+        restorecon -R "$vnc_dir" >/dev/null 2>&1 || true
+    fi
     
     print_success "用户 $username 的VNC密码已设置为: $vnc_password"
     return 0
@@ -323,7 +452,7 @@ ask_start_display() {
 # 询问并获取VNC桌面配置
 ask_vnc_desktop_config() {
     local default_geometry="1920x1080"
-    local default_session="gnome"
+    local default_session="gnome-classic"
     local geometry
     local session
     local localhost_choice
@@ -335,7 +464,7 @@ ask_vnc_desktop_config() {
         geometry="$default_geometry"
     fi
 
-    prompt_info "请输入桌面会话（如 gnome）[默认: $default_session]:"
+    prompt_info "请输入桌面会话（如 gnome-classic）[默认: $default_session]:"
     read -r session
     if [ -z "$session" ]; then
         session="$default_session"
@@ -450,6 +579,7 @@ set_vnc_display_mapping() {
     cp "$tmp_file" "$map_file"
     rm -f "$tmp_file"
     chmod 644 "$map_file"
+    invalidate_vnc_state_cache
 
     print_success "已设置VNC显示映射: :$display_no=$username"
 }
@@ -466,7 +596,32 @@ write_vnc_xstartup() {
     mkdir -p "$vnc_dir"
     session_cmd=$(get_session_start_command "$session")
 
-    cat > "$startup_file" <<EOF
+    if [ "$session" = "gnome-classic" ] || [ "$session" = "gnome-classic-session" ]; then
+        cat > "$startup_file" <<EOF
+#!/bin/sh
+unset SESSION_MANAGER
+unset DBUS_SESSION_BUS_ADDRESS
+
+if [ -x /usr/bin/gnome-session ]; then
+    exec /usr/bin/gnome-session --session=gnome-classic
+fi
+
+if [ -x /etc/X11/xinit/xinitrc ]; then
+    exec /etc/X11/xinit/xinitrc
+fi
+
+if command -v xterm >/dev/null 2>&1; then
+    exec xterm
+fi
+
+if [ -e /usr/bin/gnome-session ]; then
+    vncserver -kill $DISPLAY
+fi
+
+exit 1
+EOF
+    else
+        cat > "$startup_file" <<EOF
 #!/bin/sh
 unset SESSION_MANAGER
 unset DBUS_SESSION_BUS_ADDRESS
@@ -483,8 +638,13 @@ if command -v xterm >/dev/null 2>&1; then
     exec xterm
 fi
 
+if [ -e /usr/bin/gnome-session ]; then
+    vncserver -kill $DISPLAY
+fi
+
 exit 1
 EOF
+    fi
 
     chown "$username:$username" "$vnc_dir" "$startup_file"
     chmod 700 "$vnc_dir"
@@ -498,26 +658,18 @@ get_display_owner() {
     local display_no=$1
     local owner
 
-    owner=$(ps -eo user,args | awk -v d=":${display_no}" '
-        index($0, "/usr/bin/Xvnc " d " ") { print $1; exit }
-        $0 ~ ("/usr/bin/Xvnc " d "$") { print $1; exit }
-    ')
+    # O(1) 关联数组查找，取代 awk 子进程
+    build_vnc_process_snapshot
+    owner="${VNC_PROCESS_CACHE[$display_no]}"
+    if [ -n "$owner" ]; then echo "$owner"; return 0; fi
 
-    if [ -n "$owner" ]; then
-        echo "$owner"
-        return 0
-    fi
+    build_vnc_mapping_snapshot
+    owner="${VNC_MAPPING_CACHE[$display_no]}"
+    if [ -n "$owner" ]; then echo "$owner"; return 0; fi
 
-    owner=$(get_mapped_display_owner "$display_no")
-    if [ -n "$owner" ]; then
-        echo "$owner"
-        return 0
-    fi
-
-    owner=$(get_legacy_unit_display_owner "$display_no")
-    if [ -n "$owner" ]; then
-        echo "$owner"
-    fi
+    build_vnc_legacy_snapshot
+    owner="${VNC_LEGACY_CACHE[$display_no]}"
+    if [ -n "$owner" ]; then echo "$owner"; fi
 }
 
 # 强制回收显示号（停止旧会话并清理锁文件）
@@ -531,60 +683,50 @@ force_reclaim_display() {
     rm -f "/tmp/.X${display_no}-lock" "/tmp/.X11-unix/X${display_no}"
 }
 
-# 获取用户在旧版CentOS7自定义VNC单元中的显示号列表（不带冒号）
-get_user_vnc_displays_from_legacy_units() {
-    local username=$1
-    local unit_file
-    local display_no
-
-    for unit_file in /etc/systemd/system/vncserver@:*.service; do
-        [ -e "$unit_file" ] || continue
-
-        if ! grep -Eq "^User=${username}$|ExecStart=.*-l[[:space:]]+${username}([[:space:]]|$)" "$unit_file"; then
-            continue
-        fi
-
-        display_no=$(basename "$unit_file" | sed -E 's/^vncserver@:(.+)\.service$/\1/')
-        if [[ "$display_no" =~ ^[0-9]+$ ]]; then
-            echo "$display_no"
-        fi
-    done
+# 获取映射文件中指定显示号的用户 (弃用，保留供参考)
+get_mapped_display_owner() {
+    build_vnc_mapping_snapshot
+    echo "${VNC_MAPPING_CACHE[$1]}"
 }
 
-# 获取用户当前运行中的Xvnc显示号列表（不带冒号）
-get_user_vnc_displays_from_processes() {
-    local username=$1
-
-    ps -eo user,args | awk -v user="$username" '
-        $1 != user { next }
-        match($0, /\/usr\/bin\/Xvnc :([0-9]+)/, m) { print m[1] }
-    '
+# 获取旧版自定义单元中指定显示号的用户 (弃用，保留供参考)
+get_legacy_unit_display_owner() {
+    build_vnc_legacy_snapshot
+    echo "${VNC_LEGACY_CACHE[$1]}"
 }
 
 # 获取用户在 /etc/tigervnc/vncserver.users 或旧版自定义VNC单元中的显示号列表（不带冒号）
 get_user_vnc_displays() {
     local username=$1
-    local map_file="/etc/tigervnc/vncserver.users"
-    local mapping_displays=""
-    local legacy_displays=""
-    local process_displays=""
+    
+    build_vnc_mapping_snapshot
+    build_vnc_legacy_snapshot
+    build_vnc_process_snapshot
 
-    if [ -f "$map_file" ]; then
-        mapping_displays=$(awk -F'=' -v user="$username" '
-            /^[[:space:]]*#/ || /^[[:space:]]*$/ { next }
-            $2 == user {
-                gsub(/^:/, "", $1)
-                print $1
-            }
-        ' "$map_file")
+    # 从聚合缓存获取并去重排序，极大地减少循环中的分支调用
+    local raw_displays="${VNC_USER_DISPLAYS_CACHE["$username"]}"
+    [ -z "$raw_displays" ] && return 0
+    
+    echo "$raw_displays" | tr ' ' '\n' | awk 'NF && !seen[$0]++' | sort -n
+}
+
+# 打印用户当前VNC连接信息（显示号与端口）
+print_user_vnc_connection_hint() {
+    local username=$1
+    local displays
+
+    displays=$(get_user_vnc_displays "$username")
+    if [ -z "$displays" ]; then
+        print_warning "未找到用户 $username 的VNC显示映射"
+        return 1
     fi
 
-    legacy_displays=$(get_user_vnc_displays_from_legacy_units "$username")
-    process_displays=$(get_user_vnc_displays_from_processes "$username")
+    print_info "用户 $username 当前VNC连接信息："
+    for d in $displays; do
+        echo "  - 显示号 :$d, 端口: $((5900 + d))"
+    done
 
-    printf '%s\n%s\n%s\n' "$mapping_displays" "$legacy_displays" "$process_displays" \
-        | awk 'NF && $0 ~ /^[0-9]+$/ && !seen[$0]++ { print }' \
-        | sort -n
+    return 0
 }
 
 # 删除用户在 /etc/tigervnc/vncserver.users 的映射
@@ -607,6 +749,31 @@ remove_user_vnc_mappings() {
     cp "$tmp_file" "$map_file"
     rm -f "$tmp_file"
     chmod 644 "$map_file"
+    invalidate_vnc_state_cache
+}
+
+# 删除用户在 /etc/tigervnc/vncserver.users 的指定显示号映射
+remove_user_vnc_mapping_by_display() {
+    local username=$1
+    local display_no=$2
+    local map_file="/etc/tigervnc/vncserver.users"
+    local tmp_file
+
+    if [ ! -f "$map_file" ]; then
+        return 0
+    fi
+
+    tmp_file=$(mktemp)
+    awk -F'=' -v user="$username" -v display=":${display_no}" '
+        /^[[:space:]]*#/ || /^[[:space:]]*$/ { print; next }
+        $1 == display && $2 == user { next }
+        { print }
+    ' "$map_file" > "$tmp_file"
+
+    cp "$tmp_file" "$map_file"
+    rm -f "$tmp_file"
+    chmod 644 "$map_file"
+    invalidate_vnc_state_cache
 }
 
 # 获取活动防火墙zone（默认取第一个活动zone；取不到则回退public）
@@ -617,28 +784,63 @@ get_active_firewalld_zone() {
         return 1
     fi
 
+    if [ "$FIREWALL_ZONE_READY" -eq 1 ]; then
+        echo "$FIREWALL_ZONE_SNAPSHOT"
+        return 0
+    fi
+
     zone=$(firewall-cmd --get-active-zones 2>/dev/null | awk 'NF{print $1; exit}')
     if [ -z "$zone" ]; then
         zone="public"
     fi
+    FIREWALL_ZONE_SNAPSHOT="$zone"
+    FIREWALL_ZONE_READY=1
     echo "$zone"
 }
 
 # 清理用户的VNC资源（映射、service、进程、端口）
 cleanup_vnc_for_user() {
     local username=$1
+    local cleanup_level=${2:-standard}
+    local target_displays_input=$3
     local displays
+    local cleanup_displays=""
     local zone
     local firewall_changed=0
     local manage_firewall=0
     local unit_file_removed=0
+    local cleaned_any=0
+    local vnc_home_dir="/home/$username/.vnc"
+    local normalized_displays
+    local d
 
     displays=$(get_user_vnc_displays "$username")
 
-    if [ -z "$displays" ]; then
-        remove_user_vnc_mappings "$username"
-        print_warning "未发现用户 $username 的VNC显示号（已尝试清理映射）"
-        return 0
+    if [ -n "$target_displays_input" ]; then
+        normalized_displays=$(echo "$target_displays_input" | tr ',' ' ')
+        for d in $normalized_displays; do
+            if ! [[ "$d" =~ ^[0-9]+$ ]]; then
+                print_warning "显示号 '$d' 无效，已跳过"
+                continue
+            fi
+
+            if [[ " $cleanup_displays " == *" $d "* ]]; then
+                continue
+            fi
+
+            cleanup_displays="$cleanup_displays $d"
+        done
+
+        if [ -z "$cleanup_displays" ]; then
+            print_error "未提供有效显示号"
+            return 1
+        fi
+    else
+        cleanup_displays="$displays"
+    fi
+
+    if [ -z "$cleanup_displays" ]; then
+        print_warning "未发现用户 $username 的VNC显示号，将继续执行深度清理"
     fi
 
     if has_firewall_cmd; then
@@ -650,7 +852,7 @@ cleanup_vnc_for_user() {
         print_warning "未检测到 firewall-cmd，跳过防火墙端口清理"
     fi
 
-    for d in $displays; do
+    for d in $cleanup_displays; do
         local unit_name="vncserver@:${d}.service"
         local port=$((5900 + d))
 
@@ -659,6 +861,7 @@ cleanup_vnc_for_user() {
         remove_legacy_vnc_unit_file "$d"
         unit_file_removed=1
         force_reclaim_display "$d"
+        cleaned_any=1
         print_success "已停止并禁用 $unit_name"
 
         if [ "$manage_firewall" -eq 1 ] && firewall-cmd --zone="$zone" --query-port="${port}/tcp" >/dev/null 2>&1; then
@@ -668,8 +871,68 @@ cleanup_vnc_for_user() {
         fi
     done
 
-    remove_user_vnc_mappings "$username"
-    print_success "已清理用户 $username 的VNC显示号映射"
+    # 补充清理：仅在“清理全部显示号”时，移除任何残留的用户级VNC systemd实例
+    if [ -z "$target_displays_input" ]; then
+        local legacy_displays
+        legacy_displays=$(get_user_vnc_displays_from_legacy_units "$username")
+        for d in $legacy_displays; do
+            local unit_name="vncserver@:${d}.service"
+            local port=$((5900 + d))
+
+            systemctl stop "$unit_name" >/dev/null 2>&1 || true
+            systemctl disable "$unit_name" >/dev/null 2>&1 || true
+            remove_legacy_vnc_unit_file "$d"
+            force_reclaim_display "$d"
+            unit_file_removed=1
+            cleaned_any=1
+
+            if [ "$manage_firewall" -eq 1 ] && firewall-cmd --zone="$zone" --query-port="${port}/tcp" >/dev/null 2>&1; then
+                firewall-cmd --permanent --zone="$zone" --remove-port="${port}/tcp" >/dev/null 2>&1 || true
+                firewall_changed=1
+            fi
+        done
+    fi
+
+    # 深度清理：终止残留VNC相关进程
+    if [ -n "$target_displays_input" ]; then
+        for d in $cleanup_displays; do
+            pkill -u "$username" -f "Xvnc :${d}|Xtigervnc :${d}|vncserver :${d}" >/dev/null 2>&1 || true
+        done
+    else
+        pkill -u "$username" -f 'Xvnc|Xtigervnc|vncserver' >/dev/null 2>&1 || true
+    fi
+
+    # 深度清理：移除用户目录中的VNC运行时文件
+    if [ -d "$vnc_home_dir" ]; then
+        if [ -n "$target_displays_input" ]; then
+            for d in $cleanup_displays; do
+                rm -f "$vnc_home_dir"/*:"${d}".pid >/dev/null 2>&1 || true
+                rm -f "$vnc_home_dir"/*:"${d}".log >/dev/null 2>&1 || true
+            done
+        else
+            rm -f "$vnc_home_dir"/*.pid "$vnc_home_dir"/*:*.pid >/dev/null 2>&1 || true
+            rm -f "$vnc_home_dir"/*.log "$vnc_home_dir"/*:*.log >/dev/null 2>&1 || true
+        fi
+        rm -f "$vnc_home_dir"/*.sock "$vnc_home_dir"/*.tmp >/dev/null 2>&1 || true
+        cleaned_any=1
+
+        if [ "$cleanup_level" = "full" ] && [ -z "$target_displays_input" ]; then
+            rm -rf "$vnc_home_dir"
+            print_success "已删除用户 $username 的VNC配置目录: $vnc_home_dir"
+        elif [ "$cleanup_level" = "full" ] && [ -n "$target_displays_input" ]; then
+            print_info "已执行指定显示号的深度清理（保留 ~/.vnc 目录与其他显示号配置）"
+        fi
+    fi
+
+    if [ -n "$target_displays_input" ]; then
+        for d in $cleanup_displays; do
+            remove_user_vnc_mapping_by_display "$username" "$d"
+            print_success "已清理用户 $username 的VNC显示号映射: :$d"
+        done
+    else
+        remove_user_vnc_mappings "$username"
+        print_success "已清理用户 $username 的VNC显示号映射"
+    fi
 
     if [ "$unit_file_removed" -eq 1 ]; then
         systemctl daemon-reload >/dev/null 2>&1 || true
@@ -679,6 +942,12 @@ cleanup_vnc_for_user() {
         firewall-cmd --reload >/dev/null 2>&1 || true
         print_success "防火墙规则已重载"
     fi
+
+    if [ "$cleaned_any" -eq 0 ]; then
+        print_warning "用户 $username 未检测到可清理的VNC运行资源（已完成映射与残留检查）"
+    fi
+
+    invalidate_vnc_state_cache
 
     return 0
 }
@@ -721,7 +990,7 @@ delete_user_with_vnc_cleanup() {
         return 1
     fi
 
-    cleanup_vnc_for_user "$username"
+    cleanup_vnc_for_user "$username" "full"
     terminate_user_runtime "$username"
 
     if id "$username" &>/dev/null; then
@@ -925,6 +1194,8 @@ batch_mode() {
     echo "         批量用户创建和VNC配置"
     echo "=========================================="
     echo ""
+
+    show_existing_users_for_creation
     
     # 输入用户列表
     prompt_info "请输入用户名列表（用空格分隔）："
@@ -958,6 +1229,10 @@ batch_mode() {
         prompt_info "请输入用户备注（所有用户使用相同备注）："
         read -r comment
     fi
+
+    # 询问是否授予管理员权限
+    prompt_info "是否将这些用户设置为管理员？(y/n) [默认: n]:"
+    read -r is_admin_choice
     
     # 询问是否配置VNC
     prompt_info "是否为用户配置VNC？(y/n) [默认: n]:"
@@ -967,7 +1242,7 @@ batch_mode() {
     local use_systemd_vnc="n"
     local start_display_no="2"
     local vnc_geometry="1920x1080"
-    local vnc_session="gnome"
+    local vnc_session="gnome-classic"
     local vnc_localhost="no"
 
     if [[ "$setup_vnc_choice" =~ ^[Yy]$ ]]; then
@@ -999,7 +1274,7 @@ batch_mode() {
     local created_users=()
     local current_display_no="$start_display_no"
     for username in $user_list; do
-        create_user "$username" "$password" "$shell" "$comment"
+        create_user "$username" "$password" "$shell" "$comment" "$is_admin_choice"
         local result=$?
         
         if [ $result -eq 0 ] || [ $result -eq 2 ]; then
@@ -1010,7 +1285,11 @@ batch_mode() {
                 setup_vnc "$username" "$vnc_password"
 
                 if [[ "$use_systemd_vnc" =~ ^[Yy]$ ]]; then
-                    setup_vnc_systemd "$username" "$current_display_no" "$vnc_geometry" "$vnc_session" "$vnc_localhost"
+                    if setup_vnc_systemd "$username" "$current_display_no" "$vnc_geometry" "$vnc_session" "$vnc_localhost"; then
+                        print_user_vnc_connection_hint "$username"
+                    else
+                        print_warning "用户 $username 的systemd VNC配置失败，请检查日志"
+                    fi
                     current_display_no=$((current_display_no + 1))
                 fi
             fi
@@ -1033,6 +1312,11 @@ batch_mode() {
         echo ""
         echo "用户密码: $password"
         echo "默认Shell: $shell"
+        if [[ "$is_admin_choice" =~ ^[Yy]$ ]]; then
+            echo "管理员权限: 是"
+        else
+            echo "管理员权限: 否"
+        fi
         if [[ "$setup_vnc_choice" =~ ^[Yy]$ ]]; then
             echo "VNC密码: $vnc_password"
             if [[ "$use_systemd_vnc" =~ ^[Yy]$ ]]; then
@@ -1057,6 +1341,8 @@ single_mode() {
     echo "         单用户创建和VNC配置"
     echo "=========================================="
     echo ""
+
+    show_existing_users_for_creation
     
     # 输入用户名
     prompt_info "请输入用户名："
@@ -1090,11 +1376,15 @@ single_mode() {
         prompt_info "请输入用户备注："
         read -r comment
     fi
+
+    # 询问是否授予管理员权限
+    prompt_info "是否将用户 $username 设置为管理员？(y/n) [默认: n]:"
+    read -r is_admin_choice
     
     echo ""
     
     # 创建用户
-    create_user "$username" "$password" "$shell" "$comment"
+    create_user "$username" "$password" "$shell" "$comment" "$is_admin_choice"
     local result=$?
     
     if [ $result -eq 0 ] || [ $result -eq 2 ]; then
@@ -1130,7 +1420,11 @@ single_mode() {
                     vnc_localhost=$(echo "$desktop_conf" | cut -d'|' -f3)
 
                     echo ""
-                    setup_vnc_systemd "$username" "$display_no" "$vnc_geometry" "$vnc_session" "$vnc_localhost"
+                    if setup_vnc_systemd "$username" "$display_no" "$vnc_geometry" "$vnc_session" "$vnc_localhost"; then
+                        print_user_vnc_connection_hint "$username"
+                    else
+                        print_warning "用户 $username 的systemd VNC配置失败，请检查日志"
+                    fi
                 fi
             fi
         fi
@@ -1139,6 +1433,57 @@ single_mode() {
     echo ""
     print_success "处理完成！"
     echo ""
+}
+
+# 列表显示现有普通用户及其VNC显示号（统一辅助函数）
+list_existing_users_vnc_info() {
+    local title=$1
+    local users
+    local user
+    local displays
+
+    print_info "正在扫描系统用户和VNC状态，请稍候..."
+    invalidate_vnc_state_cache
+    build_vnc_mapping_snapshot
+    build_vnc_legacy_snapshot
+    build_vnc_process_snapshot
+
+    users=$(awk -F: '
+        $3 >= 1000 && $1 != "nobody" && $6 ~ "^/home/" {
+            print $1
+        }
+    ' /etc/passwd)
+
+    if [ -z "$users" ]; then
+        print_info "当前未检测到 /home 下的普通用户"
+        echo ""
+        return 0
+    fi
+
+    print_info "$title"
+    while IFS= read -r user; do
+        [ -z "$user" ] && continue
+        displays=$(get_user_vnc_displays "$user")
+        if [ -n "$displays" ]; then
+            local display_list=""
+            local d
+            for d in $displays; do
+                if [ -z "$display_list" ]; then
+                    display_list=":$d"
+                else
+                    display_list="$display_list, :$d"
+                fi
+            done
+            echo "  - $user (VNC显示号: $display_list)"
+        else
+            echo "  - $user (VNC显示号: 无)"
+        fi
+    done <<< "$users"
+    echo ""
+}
+
+show_existing_users_for_creation() {
+    list_existing_users_vnc_info "现有普通用户及VNC显示号："
 }
 
 # 仅VNC配置模式
@@ -1171,7 +1516,7 @@ vnc_only_mode() {
     local use_systemd_vnc
     local start_display_no="2"
     local vnc_geometry="1920x1080"
-    local vnc_session="gnome"
+    local vnc_session="gnome-classic"
     local vnc_localhost="no"
 
     use_systemd_vnc=$(ask_systemd_vnc_mode)
@@ -1193,7 +1538,11 @@ vnc_only_mode() {
         setup_vnc "$username" "$vnc_password"
 
         if [[ "$use_systemd_vnc" =~ ^[Yy]$ ]]; then
-            setup_vnc_systemd "$username" "$current_display_no" "$vnc_geometry" "$vnc_session" "$vnc_localhost"
+            if setup_vnc_systemd "$username" "$current_display_no" "$vnc_geometry" "$vnc_session" "$vnc_localhost"; then
+                print_user_vnc_connection_hint "$username"
+            else
+                print_warning "用户 $username 的systemd VNC配置失败，请检查日志"
+            fi
             current_display_no=$((current_display_no + 1))
         fi
 
@@ -1228,7 +1577,7 @@ autostart_only_mode() {
     local localhost_mode="no"
     local overwrite_xstartup_choice
     local overwrite_xstartup="n"
-    local session="gnome"
+    local session="gnome-classic"
 
     start_display_no=$(ask_start_display "请输入起始显示号（第一个用户将使用该显示号）" "2")
 
@@ -1248,10 +1597,10 @@ autostart_only_mode() {
     read -r overwrite_xstartup_choice
     if [[ "$overwrite_xstartup_choice" =~ ^[Yy]$ ]]; then
         overwrite_xstartup="y"
-        prompt_info "请输入桌面会话（如 gnome）[默认: gnome]:"
+        prompt_info "请输入桌面会话（如 gnome-classic）[默认: gnome-classic]:"
         read -r session
         if [ -z "$session" ]; then
-            session="gnome"
+            session="gnome-classic"
         fi
     fi
 
@@ -1293,7 +1642,11 @@ autostart_only_mode() {
             print_info "保留用户 $username 现有 ~/.vnc/xstartup"
         fi
 
-        enable_start_vnc_service "$username" "$resolved_display_no" "$geometry" "$localhost_mode"
+        if enable_start_vnc_service "$username" "$resolved_display_no" "$geometry" "$localhost_mode"; then
+            print_user_vnc_connection_hint "$username"
+        else
+            print_warning "用户 $username 的开机自启配置失败，请检查日志"
+        fi
         current_display_no=$((resolved_display_no + 1))
         echo ""
     done
@@ -1302,48 +1655,12 @@ autostart_only_mode() {
     echo ""
 }
 
-# 显示当前可用于VNC配置的普通用户列表
 show_existing_users_for_vnc_setup() {
-    local users
-
-    users=$(awk -F: '
-        $3 >= 1000 && $1 != "nobody" && $6 ~ "^/home/" {
-            print $1
-        }
-    ' /etc/passwd)
-
-    if [ -z "$users" ]; then
-        print_warning "未检测到 /home 下的普通用户"
-        return 0
-    fi
-
-    print_info "当前可用于VNC配置的普通用户："
-    while IFS= read -r user; do
-        [ -n "$user" ] && echo "  - $user"
-    done <<< "$users"
-    echo ""
+    list_existing_users_vnc_info "当前可用于VNC配置的普通用户（含VNC显示号）："
 }
 
-# 显示当前可删除的普通用户列表
 show_existing_users_for_delete() {
-    local users
-
-    users=$(awk -F: '
-        $3 >= 1000 && $1 != "nobody" && $6 ~ "^/home/" {
-            print $1
-        }
-    ' /etc/passwd)
-
-    if [ -z "$users" ]; then
-        print_warning "未检测到 /home 下的普通用户"
-        return 0
-    fi
-
-    print_info "当前可删除的普通用户："
-    while IFS= read -r user; do
-        [ -n "$user" ] && echo "  - $user"
-    done <<< "$users"
-    echo ""
+    list_existing_users_vnc_info "当前可删除的普通用户（含VNC显示号）："
 }
 
 # 删除用户模式（含VNC清理）
@@ -1391,12 +1708,132 @@ delete_mode() {
     echo ""
 }
 
+# 仅禁用VNC模式（保留系统用户）
+disable_vnc_only_mode() {
+    echo ""
+    echo "=========================================="
+    echo "        仅禁用VNC（保留用户）"
+    echo "=========================================="
+    echo ""
+
+    show_existing_users_for_vnc_setup
+
+    prompt_info "请输入要禁用VNC的用户名列表（用空格分隔）："
+    read -r user_list
+
+    if [ -z "$user_list" ]; then
+        print_error "用户列表不能为空！"
+        return
+    fi
+
+    echo ""
+    print_warning "禁用前检查清单："
+    echo "  - 将停止并禁用该用户相关VNC服务"
+    echo "  - 将清理显示号映射与会话进程"
+    echo "  - 将移除已添加的按端口放行规则"
+    echo "  - 不会删除Linux用户与/home目录"
+    echo ""
+    prompt_info "是否继续进入逐用户禁用确认流程？(y/n) [默认: n]:"
+    read -r pre_disable_confirm
+    if ! [[ "$pre_disable_confirm" =~ ^[Yy]$ ]]; then
+        print_warning "已取消禁用流程"
+        return
+    fi
+
+    echo ""
+    print_info "开始禁用VNC并清理资源..."
+    echo ""
+
+    for username in $user_list; do
+        local user_exists=1
+        local current_displays=""
+        local current_displays_flat=""
+        local target_display_input
+        local normalized_displays
+        local selected_displays=""
+        local display_token
+
+        prompt_info "是否确认仅禁用用户 $username 的VNC（保留系统用户）？(y/n) [默认: n]:"
+        read -r confirm_disable
+
+        if ! [[ "$confirm_disable" =~ ^[Yy]$ ]]; then
+            prompt_warning "已跳过用户 $username"
+            echo ""
+            continue
+        fi
+
+        if ! id "$username" &>/dev/null; then
+            user_exists=0
+            print_warning "用户 $username 不存在，已仅尝试执行VNC清理"
+        else
+            current_displays=$(get_user_vnc_displays "$username")
+            current_displays_flat=$(echo "$current_displays" | tr '\n' ' ')
+            if [ -n "$current_displays" ]; then
+                print_info "用户 $username 当前VNC连接信息："
+                for display_token in $current_displays; do
+                    echo "  - 显示号 :$display_token, 端口: $((5900 + display_token))"
+                done
+            else
+                print_warning "未找到用户 $username 的VNC显示映射"
+            fi
+        fi
+
+        prompt_info "请输入要清理的显示号（支持多个，如 2 5 或 2,5）。直接回车表示清理该用户全部显示号："
+        read -r target_display_input
+
+        # 回车：清理该用户全部显示号
+        if [ -z "$target_display_input" ]; then
+            cleanup_vnc_for_user "$username" "full"
+            echo ""
+            continue
+        fi
+
+        # 兼容逗号分隔输入
+        normalized_displays=$(echo "$target_display_input" | tr ',' ' ')
+
+        for display_token in $normalized_displays; do
+            if ! [[ "$display_token" =~ ^[0-9]+$ ]]; then
+                print_warning "显示号 '$display_token' 无效（必须为数字），已跳过"
+                continue
+            fi
+
+            # 去重
+            if [[ " $selected_displays " == *" $display_token "* ]]; then
+                continue
+            fi
+
+            # 对存在的用户，限制只能清理其自身显示号
+            if [ "$user_exists" -eq 1 ] && [ -n "$current_displays_flat" ] && [[ " $current_displays_flat " != *" $display_token "* ]]; then
+                print_warning "显示号 :$display_token 不属于用户 $username，已跳过"
+                continue
+            fi
+
+            selected_displays="$selected_displays $display_token"
+        done
+
+        if [ -z "$selected_displays" ]; then
+            print_warning "没有可清理的有效显示号，已跳过用户 $username"
+            echo ""
+            continue
+        fi
+
+        cleanup_vnc_for_user "$username" "full" "$selected_displays"
+        echo ""
+    done
+
+    print_success "仅禁用VNC流程完成！"
+    echo ""
+}
+
 # 显示主菜单
 show_menu() {
     clear
     echo "=========================================="
     echo "      用户和VNC管理交互式脚本"
     echo "=========================================="
+    echo -e "${YELLOW}[提示]${NC} Windows终端用户若点击屏幕导致界面冻结，"
+    echo -e "       请按下 ${BLUE}Esc${NC} 或 ${BLUE}再次点击右键${NC} 以恢复响应。"
+    echo -e "       SSH环境建议保持窗口焦点，避免在运行扫描时进行文本选择。"
     echo ""
     echo "请选择操作模式："
     echo ""
@@ -1405,7 +1842,8 @@ show_menu() {
     echo "  3) 仅为现有用户配置VNC"
     echo "  4) 仅为现有用户启用VNC开机自启"
     echo "  5) 删除用户（含VNC清理）"
-    echo "  6) 退出"
+    echo "  6) 仅禁用VNC（保留用户）"
+    echo "  7) 退出"
     echo ""
     echo "=========================================="
 }
@@ -1414,7 +1852,7 @@ show_menu() {
 main() {
     while true; do
         show_menu
-        prompt_info "请输入选项 (1-6):"
+        prompt_info "请输入选项 (1-7):"
         read -r choice
         
         case $choice in
@@ -1434,6 +1872,9 @@ main() {
                 delete_mode
                 ;;
             6)
+                disable_vnc_only_mode
+                ;;
+            7)
                 print_info "退出脚本，再见！"
                 exit 0
                 ;;
